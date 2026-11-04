@@ -2838,6 +2838,7 @@ INDEX_HTML = r"""<!doctype html>
   --text-4: #7d858d;
   --accent: #cdd4da;
   --ok: #a9c2b2;
+  --green: #3fb950;
   --warn: #cfc0a2;
   --err: #d8aaaa;
   --fs-micro: 10px;
@@ -3146,7 +3147,33 @@ input::placeholder { color: var(--text-4); }
   white-space: nowrap;
 }
 .kv .err { color: var(--err); }
-#kv-battery .bi { margin-left: 6px; color: var(--text-3); }
+#kv-battery > .bi,
+#kv-battery > .battery-state { margin-left: 6px; }
+#kv-battery .bi { color: var(--text-3); }
+#kv-battery .battery-state {
+  position: relative;
+  display: inline-block;
+  width: 1em;
+  height: 1em;
+  vertical-align: -0.125em;
+}
+#kv-battery .battery-state .bi {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1em;
+  height: 1em;
+  margin: 0;
+  line-height: 1;
+  text-align: center;
+}
+#kv-battery .battery-state .bolt {
+  top: 50%;
+  left: 50%;
+  font-size: .7em;
+  color: var(--green);
+  transform: translate(-50%, -50%) translateX(-.04em);
+}
 #libs .kv span:first-child { color: var(--text-2); }
 #libs .kv span:last-child { color: var(--text-3); }
 .upnext { max-height: 220px; overflow-y: auto; }
@@ -3972,6 +3999,24 @@ async function poll() {
   }
 }
 
+function batteryStateIcon(state) {
+  if (state === 0) {
+    return '<i class="bi bi-lightning-charge" role="img" ' +
+        'title="not charging" aria-label="not charging"></i>';
+  }
+  if (state === 1) {
+    return '<i class="bi bi-battery-charging" role="img" ' +
+        'title="charging" aria-label="charging"></i>';
+  }
+  if (state === 2) {
+    return '<span class="battery-state" role="img" ' +
+        'title="charged" aria-label="charged">' +
+        '<i class="bi bi-battery"></i>' +
+        '<i class="bi bi-lightning-charge-fill bolt"></i></span>';
+  }
+  return "";
+}
+
 function render(s) {
   const np = s.now_playing || {};
   const connected = !!s.connected;
@@ -4113,22 +4158,14 @@ function render(s) {
   const dev = s.device || {};
   const power = s.power || {};
   $("#kv-device").textContent = dev.name || "—";
-  const chargeIcon = ({
-    0: ["bi-plug", "charging off"],
-    1: ["bi-battery-charging", "charging"],
-    2: ["bi-battery-full", "charged"],
-  })[power.charging_state];
   let battery = power.battery_level == null
       ? (!connected ? "—"
          : power.supported === false ? "not supported" : "waiting…")
       : power.battery_level + "%";
   if (power.battery_level != null) {
-    if (chargeIcon) {
-      battery += `<i class="bi ${chargeIcon[0]}" role="img" ` +
-          `title="${chargeIcon[1]}" aria-label="${chargeIcon[1]}"></i>`;
-    }
+    battery += batteryStateIcon(power.charging_state);
     if (power.external_charger) {
-      battery += '<i class="bi bi-plug-fill" role="img" ' +
+      battery += '<i class="bi bi-lightning-charge-fill" role="img" ' +
           'title="external power" aria-label="external power"></i>';
     }
   }
