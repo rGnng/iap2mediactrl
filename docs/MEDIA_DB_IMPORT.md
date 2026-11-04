@@ -125,7 +125,7 @@ historical files.
 ## Web workflow
 
 Use the `MediaLibrary` button in the title bar. The panel is split into two
-columns.
+columns and all action buttons are text-only.
 
 ### Left: AFC
 
@@ -298,5 +298,7 @@ GET /api/library/artwork?album_pid=<album_pid>&size=thumb|full
 ```
 
 The Browser album **grid** uses thumbnails; album detail uses full artwork.
-The album grid has a sort menu (Recently Added / Name / Artist, plus
-Ascending / Descending), defaulting to Recently Added descending.
+The album grid and Songs view use the same select-based sort toolbar. Albums
+has `Sort` and `Order` selects (Recently Added / Name / Artist; Ascending /
+Descending) and defaults to Recently Added descending; Songs has a single
+`Sort` select.

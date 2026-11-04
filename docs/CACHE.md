@@ -23,6 +23,7 @@
 | 播放历史日志 | `data/<library_id>/history.log` | **是** | 曲目变化追加 JSON 行 |
 | 封面磁盘缓存（最多 128 张） | `data/<library_id>/artwork-cache/<id>.jpg` | **是** | FT 完成 / LRU |
 | Up Next 队列 | `QUEUE`（内存） | 否 | 设备 FT 0x0003/0x0006 或网页发起播放 |
+| 待播队列 | `QUEUE_BUILDER`（内存） | 否 | `+` / `Queue` 追加，`Play queue` 发送 |
 | HID report size 映射 | `HIDReader._report_sizes` | 否（启动时计算） | 代码/固件变化时人工确认 |
 
 进程内缓存只在**一个进程**内使用：iAP2 会话线程负责写，HTTP 线程负责读。跨线程用
@@ -143,7 +144,7 @@ iAP2 的媒体库是只读的；本地只保留一个名为 `localPlaylist` 的�
 
 - 位置：`data/<library_id>/history.log`
 - 每次曲目变化追加一行 JSON，包含 PID、标题、专辑、艺术家、时间戳和播放状态。
-- 不再维护结构化 history JSON 或智能列表；日志仅用于调试。
+- 不再维护结构化历史或智能列表；日志仅用于调试。
 
 ### 2.4 `artwork-cache/`（封面磁盘缓存）
 
@@ -229,9 +230,7 @@ if total > 64 and total % 64 <= 2:
 ```
 - `history.log`：每次曲目变化追加一行 JSON。`record_now_playing()` 在
   `0x5001` 到达时把标题/艺术家与队列条目匹配，匹配成功就记录；同一曲目 30 秒内不重复。
-- 智能列表：
-  - `history_recent(limit)`：按最近出现去重；
-  - `history_top(limit)`：按出现次数排序，附 `play_count`。
+  不再维护结构化历史或智能列表。
 
 ## 4. 一致性与并发
 
@@ -280,12 +279,12 @@ if total > 64 and total % 64 <= 2:
 | 故障 | 行为 | 恢复 |
 |---|---|---|
 | `iap2.db` 不存在 | 启动为空镜像 | 首次连接全量同步 |
-| JSON 损坏 | 打印错误，保留空镜像 | 删除文件或点“重新同步” |
+| `iap2.db` 损坏 | 打印错误，保留空镜像 | 删除文件或点“重新同步” |
 | 全量同步中断 | 内存可能不完整 | 重新同步；必要时用备份 |
 | 播放列表引用已删除曲目 | 读取时跳过并计数 | 删除该曲目或重新添加 |
 | `history.log` 损坏 | 打印/忽略错误 | 删除日志文件，重新累积 |
 | 封面缓存文件损坏 | 校验 JPEG SOI 失败则忽略 | 删除对应文件，等下一次 FT |
-| 重启后 Up Next 为空 | 队列只在内存 | 重新从网页发起播放；历史仍保留 |
+| 重启后 Up Next 为空 | `QUEUE` / `QUEUE_BUILDER` 只在内存 | 重新发起播放或重新加入队列；历史仍保留 |
 | 封面 FT 中断 | 不覆盖旧封面 | 等下一次 Now Playing/FT |
 | iAP2 断开 | 会话线程 2 秒重连 | 自动带 revision 增量同步 |
 | HID reader 读错误 | `feed_eof()` 唤醒、线程重启 | 自动重连 |

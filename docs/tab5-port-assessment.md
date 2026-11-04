@@ -709,10 +709,15 @@ UI 需要的视图：
 
 - 设备真实队列：`0x5001` 的 14/15/17 触发 FT `0x0003` 或 `0x0006`；
   解析后更新 Up Next。`source=device`。
-- 网页/UI 发起的播放：本地维护有序 PID 列表，`source=local`。
+- 网页/UI 发起的播放：本地维护有序 PID 列表，`source` 为 `single` / `album` /
+  `artist` / `genre` / `album-artist` / `device-playlist` / `queue` 等。
+- 可编辑待播队列：`QUEUE_BUILDER` 保存 `+` / `Queue` 追加的 PID；非空时 Up Next
+  显示 `source=queued`，`Play queue` 用 `0x4C07` 发送整个列表并清空。设备队列只读，
+  协议没有插入当前队列的命令。
 - 设备播放列表：`0x4C04 param3` + FT `0x0004`；只读。
-- 本地播放列表：如果产品需要，存 SQLite；播放走 `0x4C07`，最多 2,000 首。
-- 播放历史：最近 500 次曲目变化，写入 SQLite 或 JSON；用于“最近播放/最常播放”。
+- 本地播放列表：Python 版使用 `localPlaylist.csv`；移植版建议存 SQLite，播放走
+  `0x4C07`，最多 2,000 首。
+- 播放历史：Python 版仅追加 `history.log` 调试日志，不维护结构化历史或智能列表。
 - `0x4C09` 是 All Songs，不是 Recently Added；不要把它接到“最近添加”按钮。
 
 ### 8.6 添加时间与 AFC 模式
@@ -740,9 +745,9 @@ Tab5 有 5 英寸 1280×720 MIPI-DSI 屏和触摸。推荐页面：
 1. Now Playing：封面、标题、艺术家、专辑、进度、播放/暂停/上一首/下一首、
    音量步进、静音、随机、循环。
 2. Library：Albums / Artists / Album Artists / Genres / Songs /
-   Recently Added / Device Playlists。
-3. Album detail：封面、曲目表、Play album。
-4. Up Next：当前队列和接下来曲目。
+   Recently Added / localPlaylist / Device Playlists。
+3. Album detail：封面、曲目表、Play album、Queue。
+4. Up Next：当前队列和接下来曲目；有待播队列时显示 Play queue / Clear。
 5. Settings：亮度、Wi-Fi、AFC 导入模式、重新同步、日志导出。
 
 布局用两列：左侧 Now Playing + Up Next，右侧 Library。列表使用 LVGL table
@@ -757,7 +762,8 @@ typedef enum {
     CMD_VOLUME_UP, CMD_VOLUME_DOWN, CMD_MUTE,
     CMD_SHUFFLE, CMD_REPEAT,
     CMD_PLAY_ITEM, CMD_PLAY_ALBUM, CMD_PLAY_ARTIST,
-    CMD_PLAY_DEVICE_PLAYLIST, CMD_RESYNC
+    CMD_PLAY_DEVICE_PLAYLIST, CMD_QUEUE_ADD, CMD_QUEUE_PLAY,
+    CMD_QUEUE_CLEAR, CMD_RESYNC
 } app_command_type_t;
 ```
 
@@ -772,6 +778,7 @@ UI 只向 `app_command_queue` 投递命令；`iap2_task` 执行并更新状态�
 - `GET /api/library`、`/api/library/album`、`/api/library/songs`
 - `GET /api/artwork`
 - `GET /api/queue`
+- `POST /api/queue/add`、`POST /api/queue/play`、`POST /api/queue/clear`
 - `POST /api/command`、`POST /api/play`
 - `POST /api/library/sync`
 
@@ -797,7 +804,7 @@ token 或限制在受信 LAN。HTTP 不是第一版必需功能，先把 LVGL �
 | SQLite 页缓存 | 4–8 MB | 20k 条媒体库 |
 | 媒体库 DB | 约 50 MB | 必须放 SD |
 | 封面原图/缩略图 | 1.3 GB / 20 MB | SD；按需加载 |
-| 历史/播放列表 | < 10 MB | SQLite 或 JSON |
+| 历史/播放列表 | < 10 MB | SQLite；Python 版历史为 `history.log` 调试日志 |
 
 PSRAM 32 MB 足够上述运行时缓冲；内部 16 MB Flash 只放固件、证书、NVS 和少量
 资源，不放 SQLite 数据库或大封面。

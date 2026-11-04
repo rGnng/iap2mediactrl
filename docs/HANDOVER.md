@@ -2,26 +2,27 @@
 
 > Historical handover notes from an earlier snapshot. Current per-device
 > storage (`data/<library_id>/iap2.db`), `localPlaylist.csv`, `history.log`,
-> the split AFC/iAP2 panel, and the current UI are documented in `README.md`,
-> `CACHE.md`, and `MEDIA_DB_IMPORT.md`. References below to
-> `media-library.json`, `playlists.json`, and `history.json` are historical.
+> the split AFC/iAP2 panel with text-only action buttons, the editable Up Next
+> queue, and the current UI are documented in `README.md`, `CACHE.md`, and
+> `MEDIA_DB_IMPORT.md`.
 
 ## 1. 目标
 
 在 Linux 上实现一个软件 iAP2 配件，通过 USB HID 连接 iPod touch（iOS 15.7.8），实现：
 
 1. ✅ 读取 Now Playing（标题、专辑、艺术家、播放状态、进度、队列、随机/循环模式）
-2. ✅ 读取媒体库（20,564 首曲目 / 2,095 张专辑 / 5,045 位艺术家，含完整元数据）
+2. ✅ 读取媒体库（约 20.5k 首曲目 / 2,095 张专辑 / 5,045 位艺术家，含完整元数据）
 3. ✅ 控制播放（播放/暂停/停止/上一首/下一首）+ **音量 ± / 静音 / 随机 / 循环**（HID）
 4. ✅ **按曲目/专辑/艺术家/专辑艺术家/流派/本地播放列表点播**（0x4C06 / 0x4C07 / 0x4C08）
 5. ✅ 封面——200×200（27,498 字节）与 600×600（186,918 字节）JPEG 均 `djpeg` 零警告、PIL 严格解码；
    封面落盘 LRU 缓存
-6. ✅ Web UI：专辑 / 艺术家 / 专辑艺术家 / 流派 / 歌曲 / 最近添加 / 设备播放列表七个视图；
-   搜索、分页、排序、Up Next、播放历史、智能列表；本地播放列表后端/API 保留，但当前浏览器界面仅展示设备播放列表
+6. ✅ Web UI：专辑 / 艺术家 / 专辑艺术家 / 流派 / 歌曲 / 最近添加 / localPlaylist /
+   设备播放列表八个视图；搜索、分页、排序、Up Next（含可编辑待播队列）、播放日志
 
 当前阶段：**完整可用的控制系统（协议允许范围内）。** 媒体库采用“全量同步 + revision 增量”模型，
-镜像持久化到 `media-library.json`；本地播放列表持久化到 `playlists.json`；播放历史 `history.json`；
-封面缓存 `artwork-cache/`。缓存机制见 `CACHE.md`，C++/嵌入式移植草稿见 `PORTING_CPP.md`。
+镜像持久化到 `data/<library_id>/iap2.db`；本地播放列表为 `localPlaylist.csv`；播放历史追加到
+`history.log`；封面缓存 `artwork-cache/`。缓存机制见 `CACHE.md`，C++/嵌入式移植草稿见
+`PORTING_CPP.md`。
 
 ## 2. 运行环境
 
@@ -270,7 +271,7 @@ MediaItemProperties 子参数 ID（与 Now Playing 的 media item 属性一致�
 - **FT 数据帧**：剥掉每个 HID 报告的 2 字节 `[report_id][LCB]` 后，link length 与 payload checksum 都正确；原来的 `_pending_ft` 尾恢复保留为兜底。
 - **大 4C04（MediaItem 组）**：剥头后 link/CSM length 预期也恢复正确；`_fix_csm_length` 作为兜底保留。全量同步实测若仍出现 “control frame short length”，再按原始抓包确认。
 
-**持久化**：Web 服务把 {revision, items{pid: {...}}, playlists} 存到 `media-library.json`（约 10.7MB，20,564 条 + first_seen 映射），重连时带 revision 订阅，避免重复全量。
+**持久化**：Web 服务把 {revision, items{pid: {...}}, playlists} 存到 `data/<library_id>/iap2.db`（约 20.5k 条 + first_seen 映射），重连时带 revision 订阅，避免重复全量。
 
 ### 3.8.1 设备播放列表与 FT 内容（新打通）
 
@@ -283,7 +284,8 @@ MediaItemProperties 子参数 ID（与 Now Playing 的 media item 属性一致�
   `LIBRARY["playlists"][id]["items"]`。
 - 播放：`0x4C08 CollectionType=0 (Playlist)`，参数 `[playlist PID][type=0][start=0][库 UUID]`。
   真机验证 `PlaylistSync` 队列 `0/42`，第一首 `Knightmare`。
-- 设备播放列表是**只读**的；UI 显示为“设备播放列表”，仅查看/播放；本地播放列表 UI 已移除。
+- 设备播放列表是**只读**的；UI 显示为“设备播放列表”，仅查看/播放；localPlaylist 是
+  唯一的本地播放列表，可在浏览器添加/删除曲目，但不能创建/改名/删除。
 - 当前设备只有 `PlaylistSync`（42 首，跨很多专辑）。用户已确认它**不是**蓝牙上看到的
   Recently Added；它是一个普通设备播放列表。
 
@@ -350,8 +352,8 @@ USB dongle 或 btsnoop/HCI 抓包。
 - WAL 模式下用 SQLite backup API 取得一致快照，避免直接复制导致 malformed
 - `item.item_pid` 与 iAP2 MediaItem PID 完全对应
 - `item.date_added` 是 Apple/Core Data 时间（+978307200 转 Unix）
-- 当前结果：20,688 行，20,564 个 PID 全部匹配；日期范围 2024-03-21 至 2026-10-22
-- 输出 `media-db-dates.json`；`web_app.py` 只读取这个结果文件，不调用 ifuse/libimobiledevice
+- 当前结果：20,688 行，约 20.5k 个 PID 匹配；日期范围 2024-03-21 至 2026-10-22
+- 写入 `data/<library_id>/media-cache.db` 的 `dates` 表；`web_app.py` 只读取该结果，不调用 ifuse/libimobiledevice
 
 Web UI 的 Recently Added 现在优先使用真实 `date_added`，并在表格显示 Add 日期；`first_seen` 仅作兜底。
 封面也已通过独立工具 `media_db_artwork_import.py` 拉取：2,187 个唯一原图（1.34GB）、
@@ -389,23 +391,22 @@ Web UI 的 Recently Added 现在优先使用真实 `date_added`，并在表格�
 | `ref_iap2_link_layer.py` | **可用** | 参考 wiomoc 的 iAP2 链路；**FF5A 同步扫描、无 reset()、feed_eof 唤醒**；`pending_ft` / `_fix_csm_length` 作为兜底保留；常量 `FT_SESSION_ID=12`、`file_transfer_handler` 钩子 |
 | `csm.py` | 可用 | CSM 0x4040 编码/解析 |
 | `mfi_local.py` | 可用 | 本地 MFi provider |
-| `auth_test.py` | **可用（全部特性）** | 完整流程：link → auth → identification(含 HID) → 0x5000/0x4C00 → **HID play/pause/next/previous 实测** → **FT artwork 落盘** → 媒体库 0x4C03/0x4C04 实验（`LIB_EXPERIMENT=uuid|uuid+rev|full`）；`HID_COMMAND=play|pause|next|...` 发送控制命令 |
-| `web_app.py` | **可用（常驻 Web UI）** | 后台线程维护 iAP2 会话（断线自动重连）+ HTTP API + 单页控制台；Now Playing/封面/专辑/艺术家/歌曲/设备播放列表/音量/随机/循环 |
+| `auth_test.py` | **可用（全部特性）** | 完整流程：link → auth → identification(含 HID) → 0x5000/0x4C00 → **HID play/pause/next/previous 实测** → **FT artwork 落盘** → 媒体库 0x4C03/0x4C04 实验（`LIB_EXPERIMENT=uuid` / `uuid+rev` / `full`）；`HID_COMMAND=play` / `pause` / `next` / ... 发送控制命令 |
+| `web_app.py` | **可用（常驻 Web UI）** | 后台线程维护 iAP2 会话（断线自动重连）+ HTTP API + 单页控制台；Now Playing/封面/专辑/艺术家/歌曲/localPlaylist/设备播放列表/音量/随机/循环/待播队列 |
 | `run_web.sh` | 可用 | 启动 Web UI 的包装脚本（`PORT=8080 ./run_web.sh`） |
 | `docs/CACHE.md` | 文档 | 缓存/持久化机制、失效规则、嵌入式建议 |
 | `docs/reference/788716769-Accessory-Interface-Specification-R29.pdf` | 本地参考 | Apple R29 全文（1019 页）；0x4C09、队列 FT、MediaItem 属性表的权威依据；不纳入 Git |
-| `media_db_import.py` | **独立工具** | 通过 ifuse/AFC 读取 `MediaLibrary.sqlitedb`，生成 `media-db-dates.json`；不导入 iAP2/HID 代码 |
-| `docs/MEDIA_DB_IMPORT.md` | 文档 | 媒体库 DB 独立导入说明、命令、结果格式 |
-| `media-db-dates.json` | 数据 | 独立导入结果：20,688 个 PID；20,564 个匹配当前镜像 |
+| `media_db_import.py` | **独立工具** | 通过 ifuse/AFC 读取 `MediaLibrary.sqlitedb`，写入 `media-cache.db` 的 `dates` 表；不导入 iAP2/HID 代码 |
+| `docs/MEDIA_DB_IMPORT.md` | 文档 | 媒体库 DB 独立导入说明、命令、SQLite schema |
+| `data/<library_id>/media-cache.db` | 数据 | AFC 日期与封面映射 SQLite；20,688 行 dates，匹配约 20.5k 当前镜像 |
 | `artifacts/media-db-snapshot/` | 数据 | 只读 SQLite 快照（约 49MB）；含隐私元数据，勿公开；不纳入 Git |
-| `media_db_artwork_import.py` | **独立工具** | 通过 AFC 读取 `iTunes/Artwork/Originals`，生成 `media-db-artwork.json` 和本地缩略图 |
-| `media-db-artwork.json` | 数据 | 20,629 个 item / 2,090 个 album 的封面映射 |
-| `media-artwork/` | 数据 | 2,187 张原始封面（1.34GB）+ 2,179 张 160px 缩略图 |
+| `media_db_artwork_import.py` | **独立工具** | 通过 AFC 读取 `iTunes/Artwork/Originals`，写入 `media-cache.db` 映射并复制封面/缩略图 |
+| `data/<library_id>/media-artwork/` | 数据 | 2,187 张原始封面（1.34GB）+ 2,179 张 160px 缩略图 |
 | `docs/PORTING_CPP.md` | 文档 | C++/嵌入式移植草稿（架构、类草图、SQLite schema、测试计划） |
-| `media-library.json` | 数据 | 媒体库镜像（约 10.7 MB，20,564 条，含 first_seen 映射；revision 随同步递增） |
-| `playlists.json` | 数据 | 配件侧本地播放列表（iAP2 媒体库只读，不能改设备端列表） |
-| `history.json` | 数据 | 最近 500 次播放记录（智能列表/Up Next 历史） |
-| `artwork-cache/` | 数据 | 封面磁盘缓存（最多 128 张，LRU） |
+| `data/<library_id>/iap2.db` | 数据 | 媒体库镜像（约 20.5k 条，含 `first_seen_seq`；revision 随同步递增） |
+| `data/<library_id>/localPlaylist.csv` | 数据 | 唯一本地播放列表 CSV；可添加/删除曲目，不能创建/改名/删除 |
+| `data/<library_id>/history.log` | 数据 | 追加式播放日志（调试用；不维护结构化历史/智能列表） |
+| `data/<library_id>/artwork-cache/` | 数据 | 当前 Now Playing 封面缓存（最多 128 张，LRU） |
 | `artifacts/probes/link_probe.py` | 本地参考 | 早期 link probe，未用；不随仓库分发 |
 | `artifacts/probes/syn_debug.py` | 本地参考 | 原始 SYN 调试；不随仓库分发 |
 | `artifacts/probes/wiomoc_link_test.py` | 本地参考 | wiomoc link layer 参考；不随仓库分发 |
@@ -467,24 +468,25 @@ cd /home/ops/iap2mediactrl
 
 - 实时显示 Now Playing（标题/艺术家/专辑/进度/状态/队列/随机/循环/流派/音轨/App）与封面
 - 按钮：上一首 / 播放·暂停 / 下一首；**音量 −/+、静音、停止、随机、循环、继续当前队列**
-- **布局**：桌面两列（左：正在播放 / 队列 / Library 统计 / 会话；右：Browser 媒体库），页面顶部对齐；灰色深色框线、直角、等宽字体、全英文界面。Library 统计含曲目/专辑/同步/rev/库列表，Resync 小按钮在左侧。
-- **本地播放列表 UI 已移除**：不显示创建/导入/导出/加入播放列表；仅保留设备播放列表查看/播放。
-- **媒体库面板**：曲目数/专辑数/同步状态/revision；列表统一为紧凑表格，七个标签页：
-  - **专辑**：封面网格（可搜索，Recently Added / Name / Artist 排序，默认 Recently Added 降序），点专辑 → 曲目列表；
-  - **艺术家**：5,045 位艺术家（可搜索/分页），点艺术家 → 专辑列表 → 曲目；
-  - **专辑艺术家**：1,059 位（可搜索/分页），点条目 → 专辑列表；
-  - **流派**：168 个（可搜索/分页），点流派 → 专辑列表；
-  - **歌曲**：20,564 首（可搜索/分页），支持按标题/艺术家/专辑/时长/最近添加排序；
-  - **最近添加**：优先使用 `media-db-dates.json` 中的真实 `date_added`；未导入结果时回退到 `first_seen`，旧库条目可能不显示；
-  - **设备播放列表**：只读，可查看/播放；本地播放列表 UI 暂时移除。
-- **Up Next**：优先显示设备真实队列（FT 0x0003/0x0006）；网页发起的本地列表播放也会更新队列，
-  显示当前及接下来曲目（点击可单曲播放）。
-- **播放历史**：`history.json` 记录最近 500 次曲目变化；生成“最近播放”“最常播放”智能列表。
-- **本地播放列表**：后端和 HTTP API 保留；当前浏览器界面不提供创建/编辑入口。
+- **布局**：桌面两列（左：正在播放 / 队列 / Library 统计 / 会话；右：Browser 媒体库），页面顶部对齐；深色平面框线、直角、等宽字体、全英文界面。字号按 10/11/12/13/15/20px 分层，颜色按表面/文字四级 + 状态色统一。Library 统计含曲目/专辑/同步/rev/库列表，Resync 小按钮在左侧。
+- **MediaLibrary 面板**：AFC/iAP2 两列；所有操作按钮均为纯文字，无图标。
+- **媒体库面板**：曲目数/专辑数/同步状态/revision；列表统一为紧凑表格，八个标签页：
+  - **专辑**：封面网格（可搜索，`Sort` + `Order` 下拉框，默认 Recently Added 降序），点专辑 → 曲目列表；
+  - **艺术家**：约 5,045 位艺术家（可搜索/分页），点艺术家 → 专辑列表 → 曲目；
+  - **专辑艺术家**：约 1,059 位（可搜索/分页），点条目 → 专辑列表；
+  - **流派**：约 168 个（可搜索/分页），点流派 → 专辑列表；
+  - **歌曲**：约 20.5k 首（可搜索/分页），支持按标题/艺术家/专辑/时长/最近添加排序；
+  - **最近添加**：优先使用 `media-cache.db` 的 `dates` 表；支持搜索；未导入日期时回退到 `first_seen_seq`；
+  - **localPlaylist**：唯一本地播放列表，CSV 存储；可添加/删除曲目，不能创建/改名/删除；
+  - **设备播放列表**：只读，可查看/播放。
+- **Up Next**：优先显示设备真实队列（FT 0x0003/0x0006）；网页发起的播放更新本地队列。
+  曲目行 `+` 或专辑/播放列表详情的 `Queue` 可追加到待播队列；待播队列显示 `Queued · N`，
+  提供 `Play queue` / `Clear`，点击队列条目可从该位置开始播放。
+- **播放历史**：仅追加 `history.log` 调试日志；不维护结构化历史或智能列表。
 - **播放**：单曲 `0x4C07`；整张专辑/艺术家 `0x4C08`（CollectionType=2/1）；
-  流派/专辑艺术家用 `0x4C07` 有序 PID 列表；本地播放列表 `0x4C07`；
+  流派/专辑艺术家/本地列表/待播队列用 `0x4C07` 有序 PID 列表；
   恢复 iOS device 当前队列 `0x4C06`。队列信息由 0x5001 回传。
-- **封面缓存**：FT 完成后写 `artwork-cache/<id>.jpg`，最多 128 张，LRU 清理。
+- **封面缓存**：FT 完成后写 `data/<library_id>/artwork-cache/<id>.jpg`，最多 128 张，LRU 清理。
 - 断线（iOS device 休眠等）时每 2 秒自动重连；页面每秒轮询状态、进度条本地插值
 
 HTTP API：
@@ -501,41 +503,40 @@ HTTP API：
 | GET | `/api/library/album-artist?name=...` | 某专辑艺术家的专辑列表 |
 | GET | `/api/library/genres?q=&limit=&offset=` | 流派列表 |
 | GET | `/api/library/genre?name=...` | 某流派的专辑列表 |
-| GET | `/api/library/recent?limit=&offset=` | 最近添加（优先 `date_added`，回退 `first_seen`；见 `note` 字段） |
+| GET | `/api/library/recent?q=&limit=&offset=` | 最近添加（优先 `date_added`，回退 `first_seen`；见 `note` 字段） |
 | GET | `/api/library/songs?q=&limit=&offset=&sort=` | 歌曲列表；sort=title/artist/album/duration/recent |
-| GET | `/api/queue` | 队列快照（设备队列或本地队列；当前 + 接下来） |
-| GET | `/api/history?limit=` | 最近播放 |
-| GET | `/api/history/top?limit=` | 最常播放 |
-| GET | `/api/smart/recent` / `/api/smart/frequent` | 智能列表别名 |
-| GET | `/api/playlists` | 本地播放列表摘要 |
-| GET | `/api/playlists/<id>` | 播放列表详情 + 已解析曲目 |
-| GET | `/api/playlists/export` | 导出全部本地播放列表 JSON |
-| POST | `/api/playlists/import` | `{"playlists":[{"name","items"}...]}` 导入 |
-| POST | `/api/playlists` | `{"name":"..."}` 新建 |
-| POST | `/api/playlists/<id>/rename` | 重命名 |
-| POST | `/api/playlists/<id>/add` | `{"item_id":"..."}` 或 `{"item_ids":[...]}` |
-| POST | `/api/playlists/<id>/remove` | 移除 |
-| POST | `/api/playlists/<id>/move` | `{"from":n,"to":m}` 排序 |
-| POST | `/api/playlists/<id>/clear` | 清空 |
-| POST | `/api/playlists/<id>/play` | `{"start_index":n}` 播放 |
-| DELETE | `/api/playlists/<id>` | 删除 |
+| GET | `/api/queue` | Up Next 快照（设备队列或待播队列） |
+| POST | `/api/queue/add` | `{"item_ids":[...]}` 或 `{"album_pid":"..."}` 追加到待播队列 |
+| POST | `/api/queue/play` | `{"start_index":n}` 发送待播队列并播放 |
+| POST | `/api/queue/clear` | 清空待播队列 |
+| GET | `/api/history?limit=` | 兼容接口；当前返回空 |
+| GET | `/api/smart/recent` / `/api/smart/frequent` | 兼容接口；当前返回空 |
+| GET | `/api/playlists` | 唯一 localPlaylist 摘要 |
+| GET | `/api/playlists/localPlaylist` | localPlaylist 详情 + 已解析曲目 |
+| POST | `/api/playlists/localPlaylist/add` | `{"item_id":"..."}` 或 `{"item_ids":[...]}` |
+| POST | `/api/playlists/localPlaylist/remove` | 移除曲目 |
+| POST | `/api/playlists/localPlaylist/move` | `{"from":n,"to":m}` 排序 |
+| POST | `/api/playlists/localPlaylist/clear` | 清空 |
+| POST | `/api/playlists/localPlaylist/play` | `{"start_index":n}` 播放 |
 | POST | `/api/command` | `play/pause/stop/next/previous/shuffle/repeat/volume_up/volume_down/mute` |
 | POST | `/api/play` | `item_id` / `album_pid` / `artist_pid` / `genre` / `album_artist` / `item_ids` / `current_selection` |
 | POST | `/api/library/sync` | 清空媒体库镜像并断开重连，触发全量同步 |
+
+创建、重命名、删除播放列表会被拒绝（HTTP 400）；localPlaylist 是唯一本地播放列表。
 
 注意：Web 服务无鉴权，仅建议在受信局域网使用；它和 `auth_test.py` **不能同时运行**（USB HID 独占）。
 
 ## 6. 功能状态
 
-### 6.1 媒体库（已完成，20,564 首 / 2,095 张专辑 / 5,045 位艺术家）
+### 6.1 媒体库（已完成，约 20.5k 首 / 2,095 张专辑 / 5,045 位艺术家）
 
 - 全量同步流程、4C03/4C04 参数、revision 增量、reset/删除阶段、重新订阅时机见 §3.8 ✓
-- Web 服务持久化 `media-library.json`（revision + 全部曲目），重连带 revision 订阅只收增量 ✓
-- 专辑按 `album_pid` 聚合；20,563 首有专辑，1 首没有 album 属性（单曲等，正常）
+- Web 服务持久化 `data/<library_id>/iap2.db`（revision + 全部曲目），重连带 revision 订阅只收增量 ✓
+- 专辑按 `album_pid` 聚合；绝大多数曲目有专辑，个别单曲没有 album 属性（正常）
 - 派生索引：专辑（`_summary`）、艺术家（`_artists`）、歌曲（`_songs`），按库 `version` 失效
 - 设备播放列表：`0x4C04 param3` 当前有 `PlaylistSync`（42 首），内容通过
-  FT type `0x0004` 获取；设备端只读。本地播放列表 UI 暂时移除，后端数据和 API
-  仍保留在 `playlists.json` / `/api/playlists`，未从协议层删除。
+  FT type `0x0004` 获取；设备端只读。本地播放列表为 `localPlaylist.csv`，
+  可在浏览器添加/删除曲目，不能创建/改名/删除。
 
 ### 6.2 Now Playing
 
@@ -570,13 +571,12 @@ HID report descriptor 12 bit（`B0 B1 B5 B6 B9 BC E9 EA E2 B7 B3 B4`，2 字节 
 
 ### 6.4 Web UI / 播放列表
 
-- 七个标签页：专辑 / 艺术家 / 专辑艺术家 / 流派 / 歌曲 / 最近添加 / 设备播放列表；
+- 八个标签页：专辑 / 艺术家 / 专辑艺术家 / 流派 / 歌曲 / 最近添加 / localPlaylist / 设备播放列表；
 - 专辑/艺术家/专辑艺术家/流派：点条目 → 专辑 → 曲目；歌曲：点歌曲即播放；
-- 歌曲排序：标题 / 艺术家 / 专辑 / 时长 / 最近添加；
-- 设备播放列表：只查看/播放；本地播放列表 UI 已移除；
-- 智能列表：最近播放 / 最常播放（来自 `history.json`）；
-- 本地播放列表：后端和 HTTP API 保留；当前浏览器界面不提供创建/编辑入口；
-- Up Next：设备真实队列（FT 0x0003/0x0006）+ 网页发起的本地有序队列；
+- 专辑使用 `Sort` + `Order` 下拉框；歌曲使用单个 `Sort` 下拉框；
+- 设备播放列表：只查看/播放；localPlaylist：可添加/删除曲目，不能创建/改名/删除；
+- Up Next：设备真实队列（FT 0x0003/0x0006）+ 网页发起的本地有序队列 +
+  可编辑待播队列（`+` / `Queue`，`Play queue` / `Clear`）；
 - 播放：单曲 0x4C07、专辑 0x4C08 type=2、艺术家 0x4C08 type=1、
   流派/专辑艺术家/本地列表 0x4C07 有序 blob、继续当前队列 0x4C06；
 - 队列/随机/循环/流媒体信息来自 0x5001；设备队列内容来自 FT 0x0003/0x0006；真机验证：
@@ -587,7 +587,7 @@ HID report descriptor 12 bit（`B0 B1 B5 B6 B9 BC E9 EA E2 B7 B3 B4`，2 字节 
   - 单曲播放队列 `0/1`，Up Next/历史正常。
 
 **最近添加的数据来源：** iAP2 媒体库没有原生的“添加日期”字段（MediaItem property 0–20
-无日期）。`library_recent` 优先读取独立导入器生成的 `media-db-dates.json`
+无日期）。`library_recent` 优先读取独立导入器写入 `media-cache.db` 的 `dates` 表
 （`item.date_added`）；未导入时回退到 **首次发现** 时间 `first_seen`，旧库条目可能没有
 时间而不显示。新加入 iOS device 的曲目会在下一次增量同步时获得 `first_seen` 时间；如果随后
 完成 AFC 导入，则使用数据库中的真实 `date_added`。UI 的 `note` 字段会说明当前数据来源。
@@ -605,7 +605,10 @@ HID report descriptor 12 bit（`B0 B1 B5 B6 B9 BC E9 EA E2 B7 B3 B4`，2 字节 
 - **“添加日期”/Recently Added 原始字段**：iAP2 MediaItem property 0–20 没有日期；
   当前“最近添加”优先使用 AFC 导入的 `MediaLibrary.sqlitedb.item.date_added`，
   未导入时回退到 `first_seen`。未接入设备原生 Recently Added 特殊集合（见下）。
-- **设备端播放列表编辑**：iAP2 媒体库只读；配件侧本地播放列表仅保留在后端/API。
+- **设备端播放列表编辑**：iAP2 媒体库只读；`localPlaylist` 可在浏览器添加/删除曲目，
+  但不能创建/改名/删除。
+- **插入当前播放队列**：协议没有插入当前队列的命令；待播队列由配件侧维护，
+  `Play queue` 用 `0x4C07` 作为新列表发送。
 - **设备播放列表内容**：已打通！FT file type **0x0004** 是扁平 u64 PID 数组；
   `MediaPlaylistProperties` 必须请求合法 ID 0–5（尤其是 5 = FT identifier）。
   当前设备有 `PlaylistSync`（42 首），可查看/播放；设备端只读。
@@ -620,7 +623,7 @@ HID report descriptor 12 bit（`B0 B1 B5 B6 B9 BC E9 EA E2 B7 B3 B4`，2 字节 
 - **逐曲/专辑封面缩略图**：MediaItem 设备数据里没有 property 20 的 artwork ID
   （实测只发 0–19 和 25），因此无法通过 iAP2 按条目请求封面；Now Playing 封面仍走 FT。
   媒体库专辑/曲目缩略图由独立 AFC 导入器 `media_db_artwork_import.py` 生成，
-  存放在 `media-artwork/` 与 `media-db-artwork.json`。
+  存放在 `data/<library_id>/media-artwork/`，映射写入 `media-cache.db`。
 - **电池百分比**：`0xAE01 PowerUpdate` 只有 accessory power mode，没有设备电池电量。
 - **设备信息/时间/语言通知**：0x4E09–0x4E0C 存在，但当前未加入 identification 的
   received 列表（避免识别风险）；价值低，未接入。
@@ -754,5 +757,5 @@ TX CSM 0x4c03  ← 删除阶段结束后重发（带最新 revision）
 RX CSM 0x4c04  ← param2 = MediaItem 组（title/album/artist/duration/track…）
                  例：title='Fighter Girl' album='Radical Destruction' artist='F9'
                      albumArtist='Amateras Records' duration_ms=251973
-总计 20,564 首 / 2,095 张专辑（按 album_pid 聚合；当前 revision 约 882406，随播放/库变化递增）
+总计约 20.5k 首 / 2,095 张专辑（按 album_pid 聚合；当前 revision 约 882.7k，随播放/库变化递增）
 ```

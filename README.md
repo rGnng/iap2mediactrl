@@ -33,7 +33,8 @@ library contained about 20,500 tracks, 2,095 albums, and 5,045 artists.
 | HID media controls | Verified | Play, pause, next, previous, stop, shuffle, repeat, volume step, and mute through `0x6802`. |
 | Playback selection | Verified | `0x4C06` resumes the current selection; `0x4C07` plays an ordered item list; `0x4C08` plays an album, artist, or device playlist. |
 | Artwork transfer | Verified | iAP2 file-transfer type `0x0002`; 200x200 and 600x600 JPEG images; latest image kept in memory and a 128-entry LRU disk cache. |
-| Device queue | Verified | Queue request through `0x5000`; file-transfer types `0x0003` and `0x0006`; the browser Up Next view prefers the device queue. |
+| Device queue | Verified | Queue request through `0x5000`; file-transfer types `0x0003` and `0x0006`; the browser Up Next view prefers the device queue unless a local queue is being built. |
+| Up Next queue | Implemented | Accessory-side queue builder: `+` on track rows or `Queue` on album/playlist details, then `Play queue` sends the ordered list with `0x4C07`; the device queue itself remains read-only. |
 | Device playlists | Verified, read-only | Playlist groups from `0x4C04` and file-transfer type `0x0004`; the content is a big-endian array of 64-bit item persistent identifiers. |
 | Web interface and HTTP API | Implemented | `web_app.py` serves a single-page interface and a JSON API from a background iAP2 session. |
 | Date-added metadata | Verified, out-of-band | `media_db_import.py` reads `MediaLibrary.sqlitedb` over AFC and writes the `dates` table in `media-cache.db`. |
@@ -356,10 +357,11 @@ The browser interface provides:
   `Full Refresh`, `Clear AFC Cache`. iAP2 side: `Sync iAP2`, `Full Resync`,
   `Clear iAP2 Library`, `Clear iAP2 Artwork`, `Switch to iAP2`.
   Cache loading is manual. `Auto switch to iAP2 after AFC tasks` is off by
-  default and persisted in `settings.json`. Bootstrap Icons are vendored under
-  `static/bootstrap-icons/`; the page loads no external CDN assets. Browser
-  tabs are icon-only, with the search field to their right. Album and song
-  sort controls share the same select-based toolbar.
+  default and persisted in `settings.json`. All `MediaLibrary` action buttons
+  are text-only. Bootstrap Icons are vendored under `static/bootstrap-icons/`;
+  the page loads no external CDN assets. Browser tabs are icon-only, with the
+  search field to their right. Album and song sort controls share the same
+  select-based toolbar.
 
 The web interface does not implement authentication. It binds to `0.0.0.0` and
 should only be exposed on a trusted network.
@@ -421,7 +423,7 @@ endpoints are:
 | `POST` | `/api/media/action` | Start an AFC action: `pair`, `quick`, `full`, `db`, `artwork`, or `clear`. |
 | `POST` | `/api/media/cancel` | Cancel the running MediaLibrary task. |
 | `POST` | `/api/media/mode` | Switch back to iAP2 mode (`{"mode":"iap2"}`). |
-| `POST` | `/api/media/load` | Load an on-disk cache into the web process: `{"target":"library"|"artwork"|"all"}`. |
+| `POST` | `/api/media/load` | Load an on-disk cache into the web process: `{"target":"library" or "artwork" or "all"}`. |
 | `POST` | `/api/settings` | Persist UI settings, currently `{"auto_switch_iap2":bool}`. |
 
 The `/api/state` response includes a `media` object with the current device

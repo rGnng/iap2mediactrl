@@ -1,7 +1,7 @@
 # MediaCtrl Documentation
 
-- [HANDOVER.md](HANDOVER.md) — current architecture, protocol findings, status, limitations
-- [CACHE.md](CACHE.md) — runtime caches and persistence
+- [HANDOVER.md](HANDOVER.md) — historical handover notes and protocol findings (see README/CACHE for current behavior)
+- [CACHE.md](CACHE.md) — current runtime caches, queues, and persistence
 - [PORTING_CPP.md](PORTING_CPP.md) — C++ / embedded port draft
 - [MEDIA_DB_IMPORT.md](MEDIA_DB_IMPORT.md) — separate AFC/ifuse media DB + artwork importer
 - [ft-file-transfer.md](ft-file-transfer.md) — file-transfer notes

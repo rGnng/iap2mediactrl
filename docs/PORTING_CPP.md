@@ -14,7 +14,7 @@
 - USB HID 连接 iPod touch（iOS 15.7.8），configuration 2 / HID interface 2 / EP 0x83。
 - 功能：MFi 认证、识别、Now Playing、封面 FT、媒体库全量/增量、
   专辑/艺术家/专辑艺术家/流派/歌曲/最近添加/播放列表视图、
-  单曲/专辑/艺术家/流派/专辑艺术家/本地列表播放、Up Next/播放历史/智能列表、
+  单曲/专辑/艺术家/流派/专辑艺术家/本地列表播放、Up Next 队列构建、播放历史、
   HID 播放控制/音量/静音/停止/随机/循环。
 - 资源约束：单核 1 GHz、256 MB RAM、SQLite 数据库约 30–60 MB、封面缓存上限 64 MB。
 - 实时性：USB 读线程不能阻塞；iAP2 ACK/重传定时器精度 100 ms 级即可。
@@ -335,6 +335,9 @@ Idle
   - **0x0003** = 扁平大端 u64 PID 数组；
   - **0x0006** = MediaItemList（u32 count + u32 start_index + 有序 MediaItem 组）。
 - 解析后替换本地 `QUEUE`，`source="device"`；`queue_index - start_index` 为当前项。
+- 配件侧待播队列：`QUEUE_BUILDER`（内存）保存 `+` / `Queue` 追加的 PID。非空时
+  Up Next 以 `source="queued"` 返回；`Play queue` 用 `0x4C07` 发送整个有序列表并清空。
+  设备队列只读，协议没有插入当前队列的命令。
 - 当前真机验证专辑 52 首、PlaylistSync 42 首（均为 0x0003）。0x0006 已实现但未触发，
   因为队列条目都在媒体库中。
 
@@ -346,6 +349,7 @@ Idle
 | 专辑 | `0x4C08` | album PID, type=2, start_index, UUID |
 | 艺术家 | `0x4C08` | artist PID, type=1, start_index, UUID |
 | 流派 / 专辑艺术家 / 本地列表 | `0x4C07` | 有序 PID blob, start_index, UUID |
+| 待播队列 | `0x4C07` | 有序 PID blob, start_index, UUID |
 | 继续当前选择 | `0x4C06` | library UUID |
 | 播放/暂停/停止/上一首/下一首 | `0x6802` | HID component + 2 字节 report |
 | 随机/循环/音量±/静音 | `0x6802` | HID report bits |
@@ -391,7 +395,7 @@ FF/RW 短按在真机上表现为 next/previous；需要长按语义时发送 pr
 ### 9.2 本地播放列表
 
 - iAP2 媒体库只读，设备端不能创建/删除播放列表；本地播放列表由配件维护。
-- SQLite 表见 §7.1；也可以先用 JSON 文件（与 Python 版一致）。
+- SQLite 表见 §7.1；Python 版当前用 `localPlaylist.csv` 调试文件，C++ 版建议直接 SQLite。
 - 播放：把有序 PID 列表打包成 blob，发 `0x4C07`。
 - 限制：单条 CSM 消息最大 65535 字节；8 字节 PID + 4 字节 param 头 → 最多约 5,400 首。
   实际建议限制 2,000 首。
@@ -504,7 +508,7 @@ pkg_check_modules(SQLITE3 REQUIRED sqlite3)
 - [ ] `0x6802` HID 控制（play/pause/stop/next/prev/shuffle/repeat/volume/mute）。
 - [ ] 封面 FT + JPEG 校验 + `artwork-cache` LRU。
 - [ ] SQLite/播放列表/播放历史/`first_seen` 持久化 + 原子写。
-- [ ] HTTP API + 静态 UI + 分页/搜索/排序/Up Next/智能列表。
+- [ ] HTTP API + 静态 UI + 分页/搜索/排序/Up Next/可编辑待播队列。
 - [ ] 断线重连 + revision 增量。
 - [ ] 资源/掉电/长稳测试。
 
@@ -518,7 +522,7 @@ pkg_check_modules(SQLITE3 REQUIRED sqlite3)
 - **进度条/seek**：Now Playing 只给 elapsed，没有 seek 命令；HID FF/RW 已加入 descriptor，
   但短按在真机上表现为 next/previous，长按 seek 未验证。
 - **添加日期**：R29 的 MediaItem/MediaItemProperties 没有 date-added 字段；但外部
-  AFC/ifuse 导入器可读取 `MediaLibrary.sqlitedb.item.date_added`，已匹配 20,564 个 PID。
+  AFC/ifuse 导入器可读取 `MediaLibrary.sqlitedb.item.date_added`，已匹配约 20.5k 个 PID。
   Web UI 使用真实日期，`first_seen` 仅兜底。0x4C09 仍是 All Songs，不是 Recently Added；
   蓝牙原生 Recently Added 仍需 AVRCP Browsing。
 - **设备真实队列内容**：已打通。`0x5000` 的 PlaybackAttributes ID 17 +
