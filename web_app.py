@@ -3664,48 +3664,48 @@ button .bi { font-size: 1.15em; }
       <section class="media-column">
         <h4>AFC</h4>
         <div class="media-actions">
-          <button id="media-pair"><i class="bi bi-link-45deg"></i> Pair / Trust</button>
-          <button id="media-clear" class="danger"><i class="bi bi-trash"></i> Clear AFC Cache</button>
+          <button id="media-pair">Pair / Trust</button>
+          <button id="media-clear" class="danger">Clear AFC Cache</button>
         </div>
         <div class="media-section">
           <div class="kv"><span>MediaLibrary cache</span><span id="media-library-state">Not loaded</span></div>
           <div class="media-actions">
-            <button id="media-load-library"><i class="bi bi-box-arrow-in-down"></i> Load MediaLibrary</button>
-            <button id="media-update-library"><i class="bi bi-cloud-download"></i> Update MediaLibrary</button>
+            <button id="media-load-library">Load MediaLibrary</button>
+            <button id="media-update-library">Update MediaLibrary</button>
           </div>
         </div>
         <div class="media-section">
           <div class="kv"><span>Artwork cache</span><span id="media-artwork-state">Not loaded</span></div>
           <div class="media-actions">
-            <button id="media-load-artwork"><i class="bi bi-image"></i> Load Artwork</button>
-            <button id="media-update-artwork"><i class="bi bi-cloud-download"></i> Update Artwork</button>
+            <button id="media-load-artwork">Load Artwork</button>
+            <button id="media-update-artwork">Update Artwork</button>
           </div>
         </div>
         <div class="media-section">
           <div class="kv"><span>Combined sync</span><span>Updates both AFC caches</span></div>
           <div class="media-actions">
-            <button id="media-quick" class="main"><i class="bi bi-arrow-repeat"></i> Quick Sync</button>
-            <button id="media-full"><i class="bi bi-arrow-clockwise"></i> Full Refresh</button>
-            <button id="media-cancel" class="danger" style="display:none"><i class="bi bi-x-circle"></i> Cancel</button>
+            <button id="media-quick" class="main">Quick Sync</button>
+            <button id="media-full">Full Refresh</button>
+            <button id="media-cancel" class="danger" style="display:none">Cancel</button>
           </div>
         </div>
       </section>
       <section class="media-column">
         <h4>iAP2</h4>
         <div class="media-actions">
-          <button id="media-switch-iap2"><i class="bi bi-arrow-left-right"></i> Switch to iAP2</button>
+          <button id="media-switch-iap2">Switch to iAP2</button>
         </div>
         <div class="media-section">
           <div class="kv"><span>iAP2 library</span><span id="iap2-library-state">Connected</span></div>
           <div class="media-actions">
-            <button id="iap2-sync"><i class="bi bi-arrow-repeat"></i> Sync iAP2</button>
-            <button id="iap2-resync"><i class="bi bi-arrow-clockwise"></i> Full Resync</button>
+            <button id="iap2-sync">Sync iAP2</button>
+            <button id="iap2-resync">Full Resync</button>
           </div>
         </div>
         <div class="media-section">
           <div class="media-actions">
-            <button id="iap2-clear-library" class="danger"><i class="bi bi-trash"></i> Clear iAP2 Library</button>
-            <button id="iap2-clear-artwork" class="danger"><i class="bi bi-eraser"></i> Clear iAP2 Artwork</button>
+            <button id="iap2-clear-library" class="danger">Clear iAP2 Library</button>
+            <button id="iap2-clear-artwork" class="danger">Clear iAP2 Artwork</button>
           </div>
         </div>
         <label class="media-check">
@@ -3726,7 +3726,7 @@ button .bi { font-size: 1.15em; }
       <div class="media-nums" id="media-nums"></div>
       <div class="media-error" id="media-error"></div>
     </div>
-    <button class="modal-close" id="media-close"><i class="bi bi-x-lg"></i> Close</button>
+    <button class="modal-close" id="media-close">Close</button>
   </div>
 </div>
 
