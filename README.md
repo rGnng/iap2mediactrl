@@ -341,7 +341,9 @@ The browser interface provides:
   `localPlaylist`, and device playlists.
 - Search, pagination, album sorting, album detail views, and playback of
   individual tracks, albums, artists, genres, album artists, and device
-  playlists. `localPlaylist` supports adding/removing tracks; it is stored as
+  playlists. The album grid shows the iAP2 `Seen` batch and AFC `Added` date;
+  albums without an AFC date sort ahead of dated albums using their Seen
+  sequence. `localPlaylist` supports adding/removing tracks; it is stored as
   a CSV debug file and cannot be created, renamed, or deleted.
 - An Up Next view that uses the device queue when available and a local queue
   for playback initiated from the browser.

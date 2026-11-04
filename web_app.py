@@ -1232,9 +1232,15 @@ def library_summary():
         if not pid:
             continue
         g = groups.setdefault(pid, {
-            "titles": {}, "artists": {}, "tracks": 0, "date_added": 0.0})
+            "titles": {}, "artists": {}, "tracks": 0, "date_added": 0.0,
+            "first_seen_seq": None, "last_seen_seq": 0})
         g["tracks"] += 1
         g["date_added"] = max(g["date_added"], it.get("date_added") or 0.0)
+        seq = int(it.get("first_seen_seq") or 0)
+        if seq:
+            g["first_seen_seq"] = (seq if g["first_seen_seq"] is None
+                                   else min(g["first_seen_seq"], seq))
+            g["last_seen_seq"] = max(g["last_seen_seq"], seq)
         title = (it.get("album") or "").strip()
         if title:
             g["titles"][title] = g["titles"].get(title, 0) + 1
@@ -1251,7 +1257,9 @@ def library_summary():
                   if g["artists"] else "")
         albums[pid] = {"pid": pid, "artist": artist, "album": title,
                        "tracks": g["tracks"],
-                       "date_added": g["date_added"]}
+                       "date_added": g["date_added"],
+                       "first_seen_seq": g["first_seen_seq"] or 0,
+                       "last_seen_seq": g["last_seen_seq"] or 0}
         album_by_name.setdefault((artist, title), pid)
     for it in items:
         if it.get("album_pid"):
@@ -1266,17 +1274,32 @@ def library_summary():
             albums[pid]["date_added"] = max(
                 albums[pid].get("date_added") or 0.0,
                 it.get("date_added") or 0.0)
+            seq = int(it.get("first_seen_seq") or 0)
+            if seq:
+                prev = int(albums[pid].get("first_seen_seq") or 0)
+                albums[pid]["first_seen_seq"] = (
+                    seq if not prev else min(prev, seq))
+                albums[pid]["last_seen_seq"] = max(
+                    int(albums[pid].get("last_seen_seq") or 0), seq)
             continue
         key = ("name", artist, album)
         entry = albums.get(key)
         if entry is None:
             entry = {"pid": None, "artist": artist, "album": album,
-                     "tracks": 0, "date_added": 0.0}
+                     "tracks": 0, "date_added": 0.0,
+                     "first_seen_seq": 0, "last_seen_seq": 0}
             albums[key] = entry
         entry["tracks"] += 1
         entry["date_added"] = max(entry.get("date_added") or 0.0,
                                   it.get("date_added") or 0.0)
+        seq = int(it.get("first_seen_seq") or 0)
+        if seq:
+            prev = int(entry.get("first_seen_seq") or 0)
+            entry["first_seen_seq"] = seq if not prev else min(prev, seq)
+            entry["last_seen_seq"] = max(
+                int(entry.get("last_seen_seq") or 0), seq)
     summary = {
+        "version": version,
         "track_count": len(items),
         "album_count": len(albums),
         "playlist_count": playlists,
@@ -2807,6 +2830,15 @@ INDEX_HTML = r"""<!doctype html>
   .lib-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
   .lib-head h3 { margin: 0; }
   .lib-stat { margin-left: auto; font-size: 12px; color: var(--muted); }
+  .lib-head-row {
+    display: flex; align-items: center; gap: 10px;
+    margin-bottom: 10px; min-width: 0; flex-wrap: wrap;
+  }
+  .library-panel .lib-head-row .lib-tabs { flex: 0 1 auto; margin: 0; }
+  .library-panel .lib-head-row .lib-tools {
+    flex: 0 1 320px; margin: 0 0 0 auto;
+  }
+  .lib-head-row .lib-tools input { width: 100%; }
   .lib-tools { display: flex; gap: 8px; margin-bottom: 10px; }
   .lib-tools input {
     flex: 1; background: #1e2226; border: 1px solid #ffffff12; color: var(--text);
@@ -2869,6 +2901,11 @@ INDEX_HTML = r"""<!doctype html>
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .album-card .album-meta { color: #9aa0a7; font-size: 9px; }
+  .album-card .album-dates {
+    color: #8b9299; font-size: 9px; line-height: 1.3;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    font-variant-numeric: tabular-nums;
+  }
   .album-grid .empty {
     grid-column: 1 / -1; padding: 24px; text-align: center;
     color: var(--muted); font-size: 11px;
@@ -3264,8 +3301,34 @@ INDEX_HTML = r"""<!doctype html>
     .media-table .actions { width: 104px; }
   }
   .bi { vertical-align: -0.08em; }
-  button .bi, .tab .bi { margin-right: 5px; }
+  button .bi, .tab .bi { margin-right: 5px; font-size: 1.15em; }
   button.icon-only .bi, .icon-btn .bi, .play .bi { margin-right: 0; }
+  .tab { padding: 7px 10px; }
+  .tab .bi { font-size: 15px; margin-right: 0; }
+  .top-btn .bi { font-size: 14px; }
+  .small-btn .bi { font-size: 12px; }
+  .media-actions .bi { font-size: 15px; }
+  .icon-btn .bi { font-size: 14px; }
+  .play .bi { font-size: 12px; }
+  .now-card .controls { gap: 6px; margin-top: 10px; }
+  .now-card .controls button,
+  .now-card .controls button.main {
+    flex: 1 1 0; width: auto; min-width: 0; height: 44px; padding: 0;
+  }
+  .now-card .controls .bi { font-size: 24px; margin-right: 0; }
+  .now-card .controls button.main .bi { font-size: 30px; }
+  .now-card .extra-controls {
+    flex-direction: column; gap: 6px; margin-top: 8px;
+  }
+  .now-card .extra-controls .control-group {
+    display: flex; width: 100%; gap: 6px;
+  }
+  .now-card .extra-controls .control-group button {
+    flex: 1 1 0; min-width: 0; height: 32px; padding: 0;
+  }
+  .now-card .extra-controls .control-group .bi {
+    font-size: 18px; margin-right: 0;
+  }
   /* Flat UI: square corners everywhere; status dot stays circular. */
   *, *::before, *::after { border-radius: 0 !important; }
   .dot { border-radius: 50% !important; }
@@ -3308,17 +3371,19 @@ INDEX_HTML = r"""<!doctype html>
         <button id="btn-prev" class="icon-only" title="Previous" aria-label="Previous"><i class="bi bi-skip-start-fill"></i></button>
         <button id="btn-toggle" class="main icon-only" title="Play/Pause" aria-label="Play"><i class="bi bi-play-fill"></i></button>
         <button id="btn-next" class="icon-only" title="Next" aria-label="Next"><i class="bi bi-skip-end-fill"></i></button>
+        <button id="btn-stop" class="icon-only" title="Stop" aria-label="Stop"><i class="bi bi-stop-fill"></i></button>
       </div>
       <div class="extra-controls">
-        <div class="volume-row">
+        <div class="control-group volume-row">
           <button id="btn-vol-down" class="icon-only" title="Volume down" aria-label="Volume down"><i class="bi bi-volume-down-fill"></i></button>
           <button id="btn-vol-up" class="icon-only" title="Volume up" aria-label="Volume up"><i class="bi bi-volume-up-fill"></i></button>
           <button id="btn-mute" class="icon-only" title="Mute" aria-label="Mute"><i class="bi bi-volume-mute-fill"></i></button>
         </div>
-        <button id="btn-shuffle" class="icon-only" title="Shuffle off" aria-label="Shuffle"><i class="bi bi-shuffle"></i></button>
-        <button id="btn-repeat" class="icon-only" title="Repeat off" aria-label="Repeat"><i class="bi bi-repeat"></i></button>
-        <button id="btn-stop" class="icon-only" title="Stop" aria-label="Stop"><i class="bi bi-stop-fill"></i></button>
-        <button id="btn-current-selection" title="Resume iPod queue"><i class="bi bi-collection-play"></i> Resume queue</button>
+        <div class="control-group mode-row">
+          <button id="btn-shuffle" class="icon-only" title="Shuffle off" aria-label="Shuffle"><i class="bi bi-shuffle"></i></button>
+          <button id="btn-repeat" class="icon-only" title="Repeat off" aria-label="Repeat"><i class="bi bi-repeat"></i></button>
+          <button id="btn-current-selection" class="icon-only" title="Resume queue" aria-label="Resume queue"><i class="bi bi-collection-play"></i></button>
+        </div>
       </div>
     </div>
     <div class="panel queue-panel">
@@ -3353,18 +3418,20 @@ INDEX_HTML = r"""<!doctype html>
       <div class="panel-head">
         <h3>Browser</h3>
       </div>
-      <div class="lib-tabs">
-        <button class="tab active" data-tab="albums"><i class="bi bi-disc"></i> Albums</button>
-        <button class="tab" data-tab="artists"><i class="bi bi-person"></i> Artists</button>
-        <button class="tab" data-tab="album-artists"><i class="bi bi-people"></i> Album Artists</button>
-        <button class="tab" data-tab="genres"><i class="bi bi-tag"></i> Genres</button>
-        <button class="tab" data-tab="songs"><i class="bi bi-music-note-list"></i> Songs</button>
-        <button class="tab" data-tab="recent"><i class="bi bi-clock-history"></i> Recently Added</button>
-        <button class="tab" data-tab="localPlaylist"><i class="bi bi-list-check"></i> localPlaylist</button>
-        <button class="tab" data-tab="playlists"><i class="bi bi-collection-play"></i> Device Playlists</button>
-      </div>
-      <div class="lib-tools">
-        <input id="lib-search" placeholder="Search albums…">
+      <div class="lib-head-row">
+        <div class="lib-tabs">
+          <button class="tab active" data-tab="albums" title="Albums" aria-label="Albums"><i class="bi bi-disc"></i></button>
+          <button class="tab" data-tab="artists" title="Artists" aria-label="Artists"><i class="bi bi-person"></i></button>
+          <button class="tab" data-tab="album-artists" title="Album Artists" aria-label="Album Artists"><i class="bi bi-people"></i></button>
+          <button class="tab" data-tab="genres" title="Genres" aria-label="Genres"><i class="bi bi-tag"></i></button>
+          <button class="tab" data-tab="songs" title="Songs" aria-label="Songs"><i class="bi bi-music-note-list"></i></button>
+          <button class="tab" data-tab="recent" title="Recently Added" aria-label="Recently Added"><i class="bi bi-clock-history"></i></button>
+          <button class="tab" data-tab="localPlaylist" title="localPlaylist" aria-label="localPlaylist"><i class="bi bi-list-check"></i></button>
+          <button class="tab" data-tab="playlists" title="Device Playlists" aria-label="Device Playlists"><i class="bi bi-collection-play"></i></button>
+        </div>
+        <div class="lib-tools">
+          <input id="lib-search" placeholder="Search albums…">
+        </div>
       </div>
       <div class="tab-pane active" id="pane-albums">
         <div class="album-toolbar">
@@ -3531,6 +3598,7 @@ const LINK = {0: "Detecting", 1: "Negotiating", 2: "Ready", 3: "Disconnected"};
 let state = null;
 let shownArt = null;
 let lastLibraryId = null;
+let lastMediaJobState = null;
 
 function fmt(ms) {
   ms = Math.max(0, ms || 0);
@@ -3577,10 +3645,8 @@ function render(s) {
   const activeLibraryId = (media.cache || {}).library_id;
   if (activeLibraryId && activeLibraryId !== lastLibraryId) {
     lastLibraryId = activeLibraryId;
-    setTimeout(async () => {
-      await pollLibrary();
-      renderActiveTab(true);
-    }, 100);
+    lastAlbumKey = null;
+    setTimeout(refreshLibraryView, 100);
   }
   const mediaJob = media.job || null;
   const mediaBusy = !!(mediaJob &&
@@ -3739,6 +3805,10 @@ function renderMedia(media, settings) {
   const cache = media.cache || {};
   const busy = !!(job &&
       (job.state === "running" || job.state === "cancelling"));
+  if (job && job.state === "done" && lastMediaJobState !== "done") {
+    setTimeout(refreshLibraryView, 200);
+  }
+  lastMediaJobState = job ? job.state : null;
   $("#media-mode").textContent = mediaModeLabel(media.mode);
   $("#media-device").textContent = media.device || media.udid || "—";
   $("#media-library-id").textContent = cache.library_id || "—";
@@ -4050,6 +4120,11 @@ async function pollLibrary() {
   } catch (e) { /* keep the previous list */ }
 }
 
+async function refreshLibraryView() {
+  await pollLibrary();
+  renderActiveTab(true);
+}
+
 function updateLibraryStat() {
   if (!library) return;
   $("#lib-tracks").textContent =
@@ -4092,21 +4167,46 @@ function setTab(name) {
   renderActiveTab(true);
 }
 
-function compareAlbums(a, b) {
-  const dir = albumDir === "asc" ? 1 : -1;
-  let av, bv;
-  if (albumSort === "name") {
-    av = (a.album || "").toLowerCase();
-    bv = (b.album || "").toLowerCase();
-  } else if (albumSort === "artist") {
-    av = (a.artist || "").toLowerCase();
-    bv = (b.artist || "").toLowerCase();
-  } else {
-    av = Number(a.date_added) || 0;
-    bv = Number(b.date_added) || 0;
+function albumSeenLabel(a) {
+  const lo = Number(a.first_seen_seq) || 0;
+  const hi = Number(a.last_seen_seq) || 0;
+  if (!lo && !hi) return "—";
+  if (!hi || hi === lo) return `#${lo || hi}`;
+  return `#${lo}–${hi}`;
+}
+
+function albumRecencyCompare(a, b) {
+  const ad = Number(a.date_added) || 0;
+  const bd = Number(b.date_added) || 0;
+  const as = Number(a.last_seen_seq || a.first_seen_seq) || 0;
+  const bs = Number(b.last_seen_seq || b.first_seen_seq) || 0;
+  // No AFC date means the album was discovered after the last AFC sync;
+  // treat it as newer and order those albums by iAP2 seen sequence.
+  if (!ad || !bd) {
+    if (!ad && !bd) return as - bs;
+    return ad ? -1 : 1;
   }
-  if (av < bv) return -1 * dir;
-  if (av > bv) return 1 * dir;
+  if (ad !== bd) return ad - bd;
+  if (as !== bs) return as - bs;
+  return 0;
+}
+
+function compareAlbums(a, b) {
+  if (albumSort === "name" || albumSort === "artist") {
+    const dir = albumDir === "asc" ? 1 : -1;
+    const av = albumSort === "name"
+        ? (a.album || "").toLowerCase()
+        : (a.artist || "").toLowerCase();
+    const bv = albumSort === "name"
+        ? (b.album || "").toLowerCase()
+        : (b.artist || "").toLowerCase();
+    if (av < bv) return -1 * dir;
+    if (av > bv) return 1 * dir;
+  } else {
+    let cmp = albumRecencyCompare(a, b);
+    if (albumDir === "desc") cmp = -cmp;
+    if (cmp !== 0) return cmp;
+  }
   return (a.album || "").localeCompare(b.album || "") ||
          (a.artist || "").localeCompare(b.artist || "");
 }
@@ -4131,8 +4231,8 @@ function renderAlbums() {
       (a.artist || "").toLowerCase().includes(q));
   // Rebuild only when the library revision or the search term changes;
   // otherwise keep the current DOM (and scroll position) intact.
-  const key = (library.revision || "") + "|" + q + "|" +
-      albumSort + "|" + albumDir;
+  const key = (library.version || "") + "|" + (library.revision || "") +
+      "|" + lastLibraryId + "|" + q + "|" + albumSort + "|" + albumDir;
   if (key === lastAlbumKey) return;
   lastAlbumKey = key;
   albums.sort(compareAlbums);
@@ -4147,6 +4247,10 @@ function renderAlbums() {
         <div class="album-name">${esc(a.album || "—")}</div>
         <div class="album-artist">${esc(a.artist || "")}</div>
         <div class="album-meta">${a.tracks || 0} tracks</div>
+        <div class="album-dates"
+             title="iAP2 seen: ${albumSeenLabel(a)} · AFC date added: ${fmtDate(a.date_added)}">
+          Seen ${albumSeenLabel(a)} · Added ${fmtDate(a.date_added)}
+        </div>
       </div>`).join("") || '<div class="empty">No albums</div>';
   updateAlbumSortUI();
   highlightAlbum();
@@ -4884,7 +4988,7 @@ $("#btn-resync").onclick = async () => {
   try {
     const j = await postJson("/api/library/sync", {});
     toast(j.ok ? "Resync requested" : (j.error || "Resync request failed"));
-    setTimeout(pollLibrary, 1500);
+    setTimeout(refreshLibraryView, 1500);
   } catch (e) {
     toast("Resync request failed");
   }
@@ -4916,6 +5020,7 @@ async function mediaLoad(target) {
     toast(j.ok ? (any ? "Cache loaded" : "No cache file to load")
                : (j.error || "Load failed"));
     setTimeout(poll, 300);
+    setTimeout(refreshLibraryView, 400);
   } catch (e) {
     toast("Load failed");
   }
@@ -4999,7 +5104,7 @@ $("#iap2-clear-library").onclick = async () => {
     toast(j.ok ? "iAP2 library cleared; resyncing"
                : (j.error || "Clear failed"));
     setTimeout(poll, 500);
-    setTimeout(pollLibrary, 1500);
+    setTimeout(refreshLibraryView, 1500);
   } catch (e) {
     toast("Clear failed");
   }
