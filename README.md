@@ -443,8 +443,8 @@ Relevant design documents:
 
 - `docs/PORTING_CPP.md` — C++ module layout, threading model, and embedded
   constraints.
-- `docs/tab5-port-assessment.md` — ESP32-P4 and M5Stack Tab5 feasibility
-  assessment.
+- `docs/tab5-port-assessment.md` — ESP32-P4 and M5Stack Tab5 implementation
+  guide.
 - `docs/tab5-afc-db-pull-feasibility.md` — AFC database extraction, memory
   budget, and minimal protocol stack.
 
@@ -456,7 +456,7 @@ Relevant design documents:
 - `docs/PORTING_CPP.md` — C++ and embedded port draft.
 - `docs/MEDIA_DB_IMPORT.md` — AFC/ifuse database and artwork import.
 - `docs/ft-file-transfer.md` — iAP2 file-transfer concepts and command values.
-- `docs/tab5-port-assessment.md` — Tab5 port assessment.
+- `docs/tab5-port-assessment.md` — Tab5 implementation guide.
 - `docs/tab5-afc-db-pull-feasibility.md` — AFC database pull feasibility.
 
 The Apple Accessory Interface Specification is not included in this repository.
