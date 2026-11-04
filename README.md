@@ -355,7 +355,8 @@ The browser interface provides:
   Cache loading is manual. `Auto switch to iAP2 after AFC tasks` is off by
   default and persisted in `settings.json`. Bootstrap Icons are vendored under
   `static/bootstrap-icons/`; the page loads no external CDN assets. Browser
-  tabs are icon-only, with the search field to their right.
+  tabs are icon-only, with the search field to their right. Album and song
+  sort controls share the same select-based toolbar.
 
 The web interface does not implement authentication. It binds to `0.0.0.0` and
 should only be exposed on a trusted network.
@@ -402,7 +403,7 @@ endpoints are:
 | `GET` | `/api/library` | Library summary and album list. |
 | `GET` | `/api/library/album?pid=...` | Tracks in an album. |
 | `GET` | `/api/library/songs?q=&limit=&offset=&sort=` | Song list with search, pagination, and sorting. |
-| `GET` | `/api/library/recent?limit=&offset=` | Recently added tracks, using database dates when available. |
+| `GET` | `/api/library/recent?q=&limit=&offset=` | Recently added tracks, using database dates when available. |
 | `GET` | `/api/library/artwork?pid=...` or `?album_pid=...` | Imported library artwork, original or thumbnail. |
 | `GET` | `/api/queue` | Current Up Next snapshot. |
 | `POST` | `/api/command` | HID control command. |
