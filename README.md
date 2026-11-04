@@ -30,7 +30,7 @@ library contained about 20,500 tracks, 2,095 albums, and 5,045 artists.
 | Now Playing | Verified | `0x5000` subscription and `0x5001` parsing in `web_app.py`; metadata, playback state, elapsed time, queue position, shuffle and repeat mode, application name/bundle ID, playback speed, like/ban state, chapter count, and artwork transfer ID. |
 | Seek / queue jump | Verified | `0x5003` `SetNowPlayingInformation`; enabled only when `0x5001` advertises `SetElapsedTimeAvailable`; supports elapsed-time seek and device-queue index jumps. |
 | Device notifications | Verified | `0x4E09`–`0x4E0C`: device name, language, time/time-zone, and UUID. |
-| Power / battery | Rejected by test device | `0xAE00`/`0xAE01` are rejected during identification on the iPod touch (iOS 15.7.8); the UI reports power as unsupported. |
+| Power / battery | Verified | `0xAE00` `StartPowerUpdates` requests `0xAE01` `PowerUpdate`; the UI shows battery level, charging state, external power, and accessory power mode. Verified on the iPhone 17 (iOS 27.2) and iPod touch (iOS 15.7.8). A device that rejects the declarations is remembered per product and retried once without them. |
 | Media library mirror | Verified | `0x4C03` subscription and `0x4C04` updates, including reset, deletion, revision, update progress, resident-only state, and All Songs capability; each device is persisted to `data/<library_id>/iap2.db`. |
 | First-seen order | Implemented | Monotonic `first_seen_seq` batches in `iap2.db`, independent of RTC time; existing rows migrate as batch 1. |
 | HID media controls | Verified | Play, pause, next, previous, stop, shuffle, repeat, volume step, and mute through `0x6802`. |
@@ -158,8 +158,13 @@ The web UI uses param 0 for the seek slider and param 1 for device Up Next row
 clicks. `0x5002` is `StopNowPlayingUpdates`, not the setter.
 
 `0x4E09`–`0x4E0C` provide device information notifications: name, language,
-time/time-zone, and UUID. Power updates (`0xAE00`/`0xAE01`) are rejected by the
-test iPod touch during identification, so the UI has no battery value.
+time/time-zone, and UUID. For power, the accessory declares `0xAE00`/`0xAE02`
+in its sent set and `0xAE01` in its received set, sends `0xAE00`
+`StartPowerUpdates` after identification, and parses battery level, charging
+state, external charger, and accessory power mode. This is verified on both the
+iPhone 17 and the iPod touch. If a device rejects these declarations during
+identification, the app remembers that per product and reconnects once without
+power updates.
 
 ### Media library synchronization
 
@@ -496,10 +501,11 @@ limit.
   when the device advertises `SetElapsedTimeAvailable`; this is verified on the
   iPod touch. HID fast-forward/rewind still behave as next/previous on a short
   press.
-- The test iPod touch rejects `0xAE00`/`0xAE01` power-update messages during
-  identification, so battery level and charging state are not available over
-  iAP2 on this device. Use the libimobiledevice diagnostics path if battery
-  data is required.
+- Power updates are verified on both the iPhone 17 (iOS 27.2) and iPod touch
+  (iOS 15.7.8). If a device rejects the power declarations during
+  identification, the web app remembers that per product and retries once
+  without them; battery data is then unavailable for that device. Use the
+  libimobiledevice diagnostics path in that case.
 - Date Added is not part of the iAP2 media library. It is recovered from the
   device SQLite database over AFC. The value reflects the database content and
   may represent a bulk import or synchronization time.

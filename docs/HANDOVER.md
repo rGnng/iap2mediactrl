@@ -123,11 +123,13 @@ iOS device 的 USB descriptor 有 5 个 configuration：
 当前接受的消息列表：
 
 ```text
-sent:     AA01, AA03, 5000, 5002, 5003, 4C00, 4C02, 4C03, 4C05, 4C06, 4C07, 4C08, 4C09, 6800, 6802, 6803
-received: AA00, AA02, AA04, AA05, 5001, 4C01, 4C04, 6801, 6804, 4E09, 4E0A, 4E0B, 4E0C
+sent:     AA01, AA03, 5000, 5002, 5003, 4C00, 4C02, 4C03, 4C05, 4C06, 4C07, 4C08, 4C09, 6800, 6802, 6803, AE00, AE02
+received: AA00, AA02, AA04, AA05, 5001, 4C01, 4C04, 6801, 6804, 4E09, 4E0A, 4E0B, 4E0C, AE01
 ```
 
-**Power 消息在这台 iPod touch 上不可用：** 把 `0xAE00/0xAE02/0xAE03` 加入 sent 或把 `0xAE01` 加入 received，设备都会以 param 6 拒绝 identification（实测 iOS 15.7.8）。因此电池/充电状态没有走 iAP2。
+**Power 消息：** iPhone（iPhone 17 / iOS 27.2）和 iPod touch（iOS 15.7.8）均接受 `0xAE00/0xAE02`（sent）和 `0xAE01`（received）。identification 接受后发送 `0xAE00 StartPowerUpdates`，参数 0/1/2/4/5/6 均为空 payload，表示请求全部可选字段；设备随后用 `0xAE01 PowerUpdate` 上报。`BatteryChargeLevel` 是 **uint16**（不是 uint8），解析时必须用大端 16 位。实测 iPod 返回 battery=100、charging_state=0、external_charger=0；iPhone 返回 battery=59、charging_state=1、external_charger=1。
+
+**兼容性回退：** 此前的记录称 iPod touch 会拒绝 power 消息，但本次只声明 `0xAE00/0xAE02` + `0xAE01`（未声明 `0xAE03`）时成功，旧结论未复现。若其他设备仍拒绝，`web_app.py` 会按产品名记住该能力，去掉 power 消息并重连一次，避免反复被拒。
 
 **不要发送：**
 
@@ -502,7 +504,7 @@ cd /home/ops/iap2mediactrl
 - **进度条可拖动 seek**（`0x5003`，仅当设备 advertised `SetElapsedTimeAvailable`）；
   点击设备 Up Next 行可跳到对应队列索引
 - 按钮：上一首 / 播放·暂停 / 下一首；**音量 −/+、静音、停止、随机、循环、继续当前队列**
-- Session 面板显示设备名称、语言、UUID；电源消息被设备拒绝，Battery 显示 `not supported`
+- Session 面板显示设备名称、语言、UUID、电池百分比/充电状态；iPhone 和 iPod touch 均已实测显示电池数据
 - **布局**：桌面两列（左：正在播放 / 队列 / Library 统计 / 会话；右：Browser 媒体库），页面顶部对齐；深色平面框线、直角、等宽字体、全英文界面。字号按 10/11/12/13/15/20px 分层，颜色按表面/文字四级 + 状态色统一。Library 统计含曲目/专辑/同步/rev/库列表，Resync 小按钮在左侧。
 - **MediaLibrary 面板**：AFC/iAP2 两列；所有操作按钮均为纯文字，无图标。
 - **媒体库面板**：曲目数/专辑数/同步状态/revision；列表统一为紧凑表格，八个标签页：
@@ -665,10 +667,14 @@ HID report descriptor 12 bit（`B0 B1 B5 B6 B9 BC E9 EA E2 B7 B3 B4`，2 字节 
   （实测只发 0–19 和 25），因此无法通过 iAP2 按条目请求封面；Now Playing 封面仍走 FT。
   媒体库专辑/曲目缩略图由独立 AFC 导入器 `media_db_artwork_import.py` 生成，
   存放在 `data/<library_id>/media-artwork/`，映射写入 `media-cache.db`。
-- **电池百分比**：这台 iPod touch 在 identification 阶段直接拒绝 `0xAE00/0xAE02/0xAE03`
-  （sent）和 `0xAE01`（received），所以 iAP2 没有电池/充电状态。`web_app.py` 保留了
-  `0xAE01` 解析和 UI 占位，但不会声明这些消息；UI 显示 “not supported”。需要电池数据
-  时走 libimobiledevice 的 diagnostics 路径。
+- **电池百分比**：iPhone 17 / iOS 27.2 与 iPod touch / iOS 15.7.8 均已实测通过。
+  identification 声明 `0xAE00/0xAE02`（sent）和 `0xAE01`（received），接受后发送
+  `0xAE00 StartPowerUpdates`，设备回 `0xAE01`，上报 param 2（accessory power mode）、
+  4（external charger）、5（charging state）、6（battery level，**uint16**）。
+  实测 iPod 为 battery=100 / charging_state=0 / external_charger=0，iPhone 为
+  battery=59 / charging_state=1 / external_charger=1。若某设备拒绝这些声明，
+  `web_app.py` 会按产品名记住并去掉 power 消息重连一次，UI 显示 `not supported`。
+  此前“iPod 拒绝 power”的记录未复现，推测与当时声明了 `0xAE03` 或消息组合不同有关。
 - **设备信息/时间/语言通知**：已接入 `0x4E09`（名称）、`0x4E0A`（语言）、`0x4E0B`
   （时间/时区）、`0x4E0C`（UUID）；真机均收到，显示在 Session 面板。
 - **歌词 / EQ / crossfade / 音效**：iAP2 媒体库/Now Playing 不提供。

@@ -104,9 +104,10 @@ def open_hid():
 LIB_STATE = {"count": 0, "followed": False}
 STATE_REV = [None]
 local_uuid = [None]
+POWER_UPDATES = [True]
 
 
-def identification_params():
+def identification_params(include_power=True):
     sent = [
         0xAA01, 0xAA03,
         0x5000, 0x5002, 0x5003,
@@ -120,6 +121,11 @@ def identification_params():
         0x6801, 0x6804,
         0x4E09, 0x4E0A, 0x4E0B, 0x4E0C,
     ]
+    if include_power:
+        # StartPowerUpdates + StopPowerUpdates must be declared as a pair;
+        # the device reports battery/charging state with PowerUpdate.
+        sent += [0xAE00, 0xAE02]
+        received += [0xAE01]
     return [
         csm.string(0, "MediaCtrl"),
         csm.string(1, "MediaCtrl-1"),
@@ -175,6 +181,19 @@ def now_playing_params():
             [csm.void(i) for i in (0, 1, 6, 12, 14, 16, 18)],
         ),
     ]
+
+
+def power_update_params():
+    """0xAE00 StartPowerUpdates: request every optional PowerUpdate field.
+
+    The parameter payload is empty; presence of the parameter ID tells the
+    device which fields to include in later 0xAE01 PowerUpdate messages.
+    """
+    return [csm.void(pid) for pid in (0, 1, 2, 4, 5, 6)]
+
+
+async def send_start_power_updates(conn):
+    await send_csm(conn, 0xAE00, power_update_params())
 
 
 async def send_now_playing_info(conn, elapsed_ms=None, queue_index=None):
@@ -392,11 +411,15 @@ async def handle_control(conn, mfi):
             print("  authentication succeeded")
         elif msg_id == 0x1D00:
             print("  start identification")
-            await send_csm(conn, 0x1D01, identification_params())
+            await send_csm(
+                conn, 0x1D01,
+                identification_params(include_power=POWER_UPDATES[0]))
         elif msg_id == 0x1D02:
             print("  identification accepted")
             await send_csm(conn, 0x5000, now_playing_params())
             await send_csm(conn, 0x4C00, [])
+            if POWER_UPDATES[0]:
+                await send_start_power_updates(conn)
             await send_hid_start(conn)
             hid_command = os.environ.get("HID_COMMAND")
             if hid_command:
@@ -592,6 +615,17 @@ async def main():
         print("HID: pyusb direct (EP 0x83)")
     else:
         hid_device = open_hid()
+    try:
+        product = hid_device.get_product_string() or ""
+    except Exception:  # noqa: BLE001
+        product = ""
+    # Both the iPod touch and iPhone accept the power messages. Keep the
+    # environment override for probing devices that reject them.
+    POWER_UPDATES[0] = True
+    if "IAP2_POWER" in os.environ:
+        POWER_UPDATES[0] = os.environ["IAP2_POWER"] != "0"
+    print(f"Power updates: {'on' if POWER_UPDATES[0] else 'off'}"
+          + (f" ({product})" if product else ""))
     mfi = LocalMfiProvider(CERT_PATH, KEY_PATH)
     print(
         f"MFi loaded: certificate={len(mfi.certificate_blob())} bytes, "

@@ -35,6 +35,7 @@ from auth_test import (
     now_playing_params,
     open_hid,
     parse_library_info,
+    power_update_params,
     send_csm,
     send_hid_command,
     send_hid_start,
@@ -69,6 +70,16 @@ MEDIA_DATES = {"mtime": 0.0, "dates": {}, "loaded": False}
 MEDIA_ARTWORK = {"mtime": 0.0, "items": {}, "albums": {},
                  "loaded": False, "files": 0}
 SETTINGS = {"auto_switch_iap2": False}
+POWER_DEFAULTS = {
+    "max_current_ma": None,
+    "device_will_charge": None,
+    "accessory_power_mode": None,
+    "external_charger": None,
+    "charging_state": None,
+    "battery_level": None,
+    "supported": None,
+    "updated_at": 0.0,
+}
 STATE = {
     "connected": False,
     "link_state": None,
@@ -112,15 +123,7 @@ STATE = {
         "artwork_id": None,
         "updated_at": 0.0,
     },
-    "power": {
-        "max_current_ma": None,
-        "device_will_charge": None,
-        "accessory_power_mode": None,
-        "external_charger": None,
-        "charging_state": None,
-        "battery_level": None,
-        "updated_at": 0.0,
-    },
+    "power": dict(POWER_DEFAULTS),
     "device": {
         "name": "",
         "language": "",
@@ -1932,6 +1935,9 @@ class Session:
         self._stop = threading.Event()
         self._resynced = False
         self._saved_version = -1
+        self._product = ""
+        self._power_capability = {}
+        self._power_updates = True
 
     # -- lifecycle ---------------------------------------------------
     def start(self):
@@ -1984,6 +1990,16 @@ class Session:
         self._resynced = False
         set_configuration()
         hid_device = open_hid()
+        try:
+            self._product = hid_device.get_product_string() or ""
+        except Exception:  # noqa: BLE001
+            self._product = ""
+        # Both tested devices accept the power messages. Remember a rejection
+        # per product so an incompatible device is not retried every time.
+        self._power_updates = self._power_capability.setdefault(
+            self._product, True)
+        with STATE_LOCK:
+            STATE["power"] = dict(POWER_DEFAULTS)
         reader = hid_async.HIDReader(hid_device, INPUT_REPORTS)
         writer = hid_async.HIDWriter(hid_device, sorted(OUTPUT_REPORTS.items()))
         conn = link_layer.IAP2Connection(
@@ -2495,18 +2511,25 @@ class Session:
             elif msg_id == 0xAA04:
                 self._set_error("MFi authentication failed")
             elif msg_id == 0x1D00:
-                await send_csm(conn, 0x1D01, identification_params())
+                await send_csm(
+                    conn, 0x1D01,
+                    identification_params(include_power=self._power_updates))
             elif msg_id == 0x1D02:
                 with STATE_LOCK:
                     STATE["connected"] = True
                     STATE["last_error"] = None
+                    STATE["power"]["supported"] = self._power_updates
                 await send_csm(conn, 0x5000, now_playing_params())
                 await send_csm(conn, 0x4C00, [])
+                if self._power_updates:
+                    await send_csm(conn, 0xAE00, power_update_params())
                 await send_hid_start(conn)
                 self._event("Connected")
             elif msg_id == 0x1D03:
                 rejected = []
+                rejected_pids = set()
                 for pid, payload in csm.parse_params(body):
+                    rejected_pids.add(pid)
                     if pid in (6, 7) and payload:
                         ids = [f"0x{int.from_bytes(payload[i:i + 2], 'big'):04x}"
                                for i in range(0, len(payload) - 1, 2)]
@@ -2514,6 +2537,22 @@ class Session:
                         rejected.append(f"{label}: {', '.join(ids)}")
                     else:
                         rejected.append(f"param {pid}")
+                if (self._power_updates
+                        and (6 in rejected_pids or 7 in rejected_pids)):
+                    self._power_capability[self._product] = False
+                    self._power_updates = False
+                    with STATE_LOCK:
+                        STATE["power"]["supported"] = False
+                        STATE["last_error"] = (
+                            "identification rejected with power updates; "
+                            "retrying without them")
+                    self._event(
+                        "Power updates rejected; reconnecting without them")
+                    try:
+                        conn.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return
                 with STATE_LOCK:
                     STATE["last_error"] = (
                         "identification rejected"
@@ -2545,7 +2584,10 @@ class Session:
                         elif pid == 5 and payload:
                             power["charging_state"] = payload[0]
                         elif pid == 6 and payload:
-                            power["battery_level"] = payload[0]
+                            # BatteryChargeLevel is uint16 per R29 Table 97-143.
+                            power["battery_level"] = int.from_bytes(
+                                payload, "big")
+                    power["supported"] = True
                     power["updated_at"] = time.time() * 1000.0
             elif msg_id in (0x4E09, 0x4E0A, 0x4E0B, 0x4E0C):
                 with STATE_LOCK:
@@ -3104,6 +3146,7 @@ input::placeholder { color: var(--text-4); }
   white-space: nowrap;
 }
 .kv .err { color: var(--err); }
+#kv-battery .bi { margin-left: 6px; color: var(--text-3); }
 #libs .kv span:first-child { color: var(--text-2); }
 #libs .kv span:last-child { color: var(--text-3); }
 .upnext { max-height: 220px; overflow-y: auto; }
@@ -4070,13 +4113,26 @@ function render(s) {
   const dev = s.device || {};
   const power = s.power || {};
   $("#kv-device").textContent = dev.name || "—";
-  const chargeState = ({0: "charging off", 1: "charging",
-                        2: "charged"})[power.charging_state];
-  $("#kv-battery").textContent = power.battery_level == null
-      ? (connected ? "not supported" : "—")
-      : power.battery_level + "%" +
-        (chargeState ? " · " + chargeState : "") +
-        (power.external_charger ? " · external power" : "");
+  const chargeIcon = ({
+    0: ["bi-plug", "charging off"],
+    1: ["bi-battery-charging", "charging"],
+    2: ["bi-battery-full", "charged"],
+  })[power.charging_state];
+  let battery = power.battery_level == null
+      ? (!connected ? "—"
+         : power.supported === false ? "not supported" : "waiting…")
+      : power.battery_level + "%";
+  if (power.battery_level != null) {
+    if (chargeIcon) {
+      battery += `<i class="bi ${chargeIcon[0]}" role="img" ` +
+          `title="${chargeIcon[1]}" aria-label="${chargeIcon[1]}"></i>`;
+    }
+    if (power.external_charger) {
+      battery += '<i class="bi bi-plug-fill" role="img" ' +
+          'title="external power" aria-label="external power"></i>';
+    }
+  }
+  $("#kv-battery").innerHTML = battery;
   $("#kv-art").textContent = (np.artwork_id ?? "—") + " / " +
       (s.artwork_size ? Math.round(s.artwork_size / 1024) + " KB" : "—");
   $("#kv-event").textContent = s.last_event || "—";
