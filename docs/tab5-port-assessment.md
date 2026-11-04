@@ -125,7 +125,7 @@ SQLite（ESP-IDF 组件或自行集成）
 
 ### 4.1 枚举与配置选择
 
-iPod 有 5 个 configuration，iAP2 使用 **configuration 2**：Audio + HID，
+iOS device 有 5 个 configuration，iAP2 使用 **configuration 2**：Audio + HID，
 HID interface 为 interface 2，输入端点为 `0x83`（interrupt IN，64 字节，
 bInterval 1）。输出通过控制端点发送 `SET_REPORT`。
 
@@ -844,7 +844,7 @@ PSRAM 32 MB 足够上述运行时缓冲；内部 16 MB Flash 只放固件、证�
    digest，不要重复 SHA-256。
 10. **内存**：不要在 PSRAM 里保留整库 JSON 或多个 600×600 解码缓冲；SQLite
     分页 + 单张封面缓存。
-11. **USB 供电**：Tab5 的 USB-A 有负载开关，实测 iPod 充电时的电压/电流；
+11. **USB 供电**：Tab5 的 USB-A 有负载开关，实测 iOS device 充电时的电压/电流；
     电池续航会明显下降。
 12. **AFC 与 iAP2 互斥**：configuration 2 与 3/4 不能同时使用；切换需要
     重新枚举 USB。

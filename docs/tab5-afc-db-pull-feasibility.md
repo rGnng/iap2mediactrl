@@ -1,10 +1,10 @@
 # Tab5 单独取 MediaLibrary.sqlitedb 可行性调研
 
-> 目标：只实现“从 iPod 取 `MediaLibrary.sqlitedb`”这一个功能，是否能在
+> 目标：只实现“从 iOS device 取 `MediaLibrary.sqlitedb`”这一个功能，是否能在
 > M5Stack Tab5（ESP32-P4，16 MB Flash / 32 MB PSRAM / microSD / USB-A Host）
 > 上独立完成；如果空间不够，精简 `libimobiledevice` 是否现实。
 >
-> 调研日期：2026-11-04。实测设备：iPod，iOS 15.7.8，USB 05ac:12aa。
+> 调研日期：2026-11-04。实测设备：iPod touch，iOS 15.7.8，USB 05ac:12aa。
 
 ## 0. 结论摘要
 
@@ -26,17 +26,17 @@
    `StartSession` 返回 `EnableSessionSSL = 1`。所以只需要用 mbedTLS 保护
    lockdown 那一小段握手，AFC 数据本身是明文。这比“全链路 TLS”简单很多。
 5. **最大的产品风险是配对，不是代码。**
-   当前 iPod 已经和 Linux 主机配对，可以直接把 9.4 KB 的 pair record
+   当前 iOS device 已经和 Linux 主机配对，可以直接把 9.4 KB 的 pair record
    复制到 Tab5。若要支持“任意新设备/首次配对”，还要实现 RSA 密钥/证书生成、
    Trust 弹窗流程，工作量会明显上升。
 
 ## 1. 实测结果（不是纸面推算）
 
-在现有 Linux 主机上，把 iPod 切到 usbmux 配置后实测：
+在现有 Linux 主机上，把 iOS device 切到 usbmux 配置后实测：
 
 | 项目 | 实测值 |
 |---|---|
-| 设备 | iPod，iOS 15.7.8 |
+| 设备 | iPod touch，iOS 15.7.8 |
 | usbmuxd 选择的配置 | configuration 4（PTP + Apple Mobile Device + Ethernet） |
 | 也可用的最小配置 | configuration 3（PTP + Apple Mobile Device；结构上有 mux interface，建议 PoC 单独验证） |
 | mux 接口 | interface 1，class 0xff/0xfe/0x02，EP 0x04 OUT / 0x85 IN，bulk 512 |
@@ -263,11 +263,11 @@ libusbmuxd 66 KB、glue 131 KB；即使加上 mbedTLS，也就 1–2 MB 量级�
   不是稳定的公开 API**。
 - 所以如果 Tab5 既要当播放器又要取 DB，需要：
   1. 停止 iAP2，释放 HID interface；
-  2. 通过 Tab5 的 USB-A 5V 开关（PI4IOE1 P3 / `USB5V_EN`）给 iPod
+  2. 通过 Tab5 的 USB-A 5V 开关（PI4IOE1 P3 / `USB5V_EN`）给 iOS device
      断电再上电，强制重新枚举；
   3. 这次枚举选 config 3/4，做 AFC；
   4. 再断电/上电，选回 config 2，重连 iAP2。
-- 这会打断播放，iPod 可能需要重新解锁；适合“手动同步一次”，不适合
+- 这会打断播放，iOS device 可能需要重新解锁；适合“手动同步一次”，不适合
   后台自动频繁同步。
 
 如果 Tab5 只做“取 DB”，开机就选 config 3/4，不做 iAP2，就完全没有这个

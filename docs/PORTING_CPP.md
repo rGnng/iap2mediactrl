@@ -524,7 +524,7 @@ pkg_check_modules(SQLITE3 REQUIRED sqlite3)
   PlaybackQueueListContentTransferInfoRequest 组触发；设备用 FT **0x0003**（PID 数组）
   或 **0x0006**（MediaItemList）发送。真机验证 52/42 首。0x0004 仍用于设备播放列表。
   蓝牙上的 Recently Added 仍可能是 AVRCP browsing 的虚拟目录。
-- **多设备/多会话**：当前是单 iPod、单 iAP2 连接；多设备需要会话管理器和 USB 热插拔。
+- **多设备/多会话**：当前是单台 iOS device、单 iAP2 连接；多设备需要会话管理器和 USB 热插拔。
 - **性能**：20k 条 JSON 在低端 ARM 上会慢；必须用 SQLite/分页，不要照搬 Python 的
   “一次返回全部专辑/歌曲”。
 

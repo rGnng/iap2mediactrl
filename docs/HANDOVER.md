@@ -28,10 +28,10 @@
 | Python | 3.14.4 |
 | 虚拟环境 | `/home/ops/iap2mediactrl/.venv`（含 pyusb / hidapi / cryptography / **pillow**） |
 | 权限 | `ops` 可免密 sudo |
-| USB 角色 | Linux 是 USB Host，iPod 是 USB Device |
+| USB 角色 | Linux 是 USB Host，iOS device 是 USB Device |
 | Gadget | 无 `/sys/class/udc`，不能走 USB Device/Gadget 路线 |
 
-### iPod
+### 测试设备（iOS device）
 
 | 项目 | 值 |
 |---|---|
@@ -56,7 +56,7 @@
 
 ### 3.1 USB 路线
 
-iPod 的 USB descriptor 有 5 个 configuration：
+iOS device 的 USB descriptor 有 5 个 configuration：
 
 | Config | 内容 | 用途 |
 |---|---|---|
@@ -128,7 +128,7 @@ received: AA00, AA02, AA04, AA05, 5001, 4C01, 4C04, 6801, 6804
 
 ### 3.5 Now Playing
 
-已成功，真实播放中数据（iPod 正在播放 *Shifting Temple*）：
+已成功，真实播放中数据（iOS device 正在播放 *Shifting Temple*）：
 
 ```text
 RX CSM 0x5001
@@ -251,7 +251,7 @@ MediaItemProperties 子参数 ID（与 Now Playing 的 media item 属性一致�
 7: 实测存在但规范 R2 未列出（1 字节标志；0x00=普通，0x5A=该批为"完整数据库"类消息）
 ```
 
-**实测流程（iPhone/iPod iOS 15.7.8）：**
+**实测流程（iOS device：iPod touch / iPhone，iOS 15.7.8）：**
 
 1. 首次同步发送 4C03：`[uuid, revision="0", item-props, playlist-props]`
 2. 设备先发 `4C04(param6=reset)`，随后是**大量 param4/param5 删除消息**（所有条目 ID，约 1.5 万条/6 万个 ID）
@@ -351,7 +351,7 @@ Web UI 的 Recently Added 现在优先使用真实 `date_added`，并在表格�
 封面也已通过独立工具 `media_db_artwork_import.py` 拉取：2,187 个唯一原图（1.34GB）、
 20,629 个 item 映射、2,090 个 album 映射；Browser 专辑表显示缩略图，详情显示原图。
 首次全量拉取实测 **113.56 秒**（约 11.8 MB/s）。
-导入时 iAP2/HID 服务与 AFC 不能同时占用 iPod（USB config 2 vs 3），操作步骤见 `MEDIA_DB_IMPORT.md`。
+导入时 iAP2/HID 服务与 AFC 不能同时占用 iOS device（USB config 2 vs 3），操作步骤见 `MEDIA_DB_IMPORT.md`。
 
 ### 3.9 HID 报告重组（封面撕裂的真正根因）
 
@@ -405,7 +405,7 @@ Web UI 的 Recently Added 现在优先使用真实 `date_added`，并在表格�
 | `artifacts/probes/wiomoc_link_test.py` | 本地参考 | wiomoc link layer 参考；不随仓库分发 |
 | `artifacts/logs/hid-test-01..07.log` | 日志 | HID component 0x0012 识别 → StartHID → **play/pause/next/previous 全部实测** |
 | `artifacts/logs/media-library-01..15.log` | 日志 | 媒体库调试全过程（含 4C01 原始 TLV、4C03/4C04、FT artwork 过程） |
-| `artifacts/logs/media-library-06/10/13.log` | 日志 | **HID 帧实验：URB 原始字节 dump**（`HID_LOG_RAW=1`），确定了 iPod 的 URB 分帧方式 |
+| `artifacts/logs/media-library-06/10/13.log` | 日志 | **HID 帧实验：URB 原始字节 dump**（`HID_LOG_RAW=1`），确定了 iOS device 的 URB 分帧方式 |
 | `artifacts/captures/media-library-body-4c01.bin` / `-4c04.bin` | dump | 媒体库原始 body（4C01 含两库 UUID/修订号；4C04 含修订信息） |
 | `artifacts/artwork/artwork-251.jpg` / `artwork-600-clean.jpg` | 产物/调试 | 干净版：200×200，27,498B；600×600，186,918B；旧文件保留为不同阶段的撕裂样本 |
 
@@ -447,7 +447,7 @@ sudo .venv/bin/python auth_test.py
 | `HID_COMMAND` | `play` / `pause` / `next` / `previous` / ... | identification 后 2 秒发送 HID 命令；空=不发送 |
 | `HID_LOG_RAW` | `1` | 打印每个 URB 原始字节（调试） |
 
-注意：每次运行都是完整 `identification → 拒绝/接受 → 5000/4C00` 流程，约 30 秒后自动退出。iPod 每次重连都需要重新走完整 identification（不支持会话恢复）。
+注意：每次运行都是完整 `identification → 拒绝/接受 → 5000/4C00` 流程，约 30 秒后自动退出。iOS device 每次重连都需要重新走完整 identification（不支持会话恢复）。
 
 ### 5.4 Web UI（常驻）
 
@@ -477,9 +477,9 @@ cd /home/ops/iap2mediactrl
 - **本地播放列表**：后端和 HTTP API 保留；当前浏览器界面不提供创建/编辑入口。
 - **播放**：单曲 `0x4C07`；整张专辑/艺术家 `0x4C08`（CollectionType=2/1）；
   流派/专辑艺术家用 `0x4C07` 有序 PID 列表；本地播放列表 `0x4C07`；
-  恢复 iPod 当前队列 `0x4C06`。队列信息由 0x5001 回传。
+  恢复 iOS device 当前队列 `0x4C06`。队列信息由 0x5001 回传。
 - **封面缓存**：FT 完成后写 `artwork-cache/<id>.jpg`，最多 128 张，LRU 清理。
-- 断线（iPod 休眠等）时每 2 秒自动重连；页面每秒轮询状态、进度条本地插值
+- 断线（iOS device 休眠等）时每 2 秒自动重连；页面每秒轮询状态、进度条本地插值
 
 HTTP API：
 
@@ -583,7 +583,7 @@ HID report descriptor 12 bit（`B0 B1 B5 B6 B9 BC E9 EA E2 B7 B3 B4`，2 字节 
 **最近添加的数据来源：** iAP2 媒体库没有原生的“添加日期”字段（MediaItem property 0–20
 无日期）。`library_recent` 优先读取独立导入器生成的 `media-db-dates.json`
 （`item.date_added`）；未导入时回退到 **首次发现** 时间 `first_seen`，旧库条目可能没有
-时间而不显示。新加入 iPod 的曲目会在下一次增量同步时获得 `first_seen` 时间；如果随后
+时间而不显示。新加入 iOS device 的曲目会在下一次增量同步时获得 `first_seen` 时间；如果随后
 完成 AFC 导入，则使用数据库中的真实 `date_added`。UI 的 `note` 字段会说明当前数据来源。
 
 ### 6.5 封面
@@ -619,7 +619,7 @@ HID report descriptor 12 bit（`B0 B1 B5 B6 B9 BC E9 EA E2 B7 B3 B4`，2 字节 
 - **设备信息/时间/语言通知**：0x4E09–0x4E0C 存在，但当前未加入 identification 的
   received 列表（避免识别风险）；价值低，未接入。
 - **歌词 / EQ / crossfade / 音效**：iAP2 媒体库/Now Playing 不提供。
-- **Web 鉴权 / 多设备**：当前无鉴权（仅 LAN）、单 iPod 单会话；生产需加 token/会话管理。
+- **Web 鉴权 / 多设备**：当前无鉴权（仅 LAN）、单台 iOS device、单 iAP2 连接；生产需加 token/会话管理。
 
 ### 6.7 代码健壮性
 
@@ -657,7 +657,7 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-5. 确认 iPod 已直通到 Linux：
+5. 确认 iOS device 已直通到 Linux：
 
 ```bash
 lsusb -d 05ac:
@@ -667,13 +667,13 @@ lsusb -t
 6. 用 root 或配置 udev 权限运行 USB/HID 操作。
 7. 先跑 `auth_test.py`。如需底层调试，再运行本地的
    `artifacts/probes/ipod_probe.py` 和 `artifacts/probes/hid_probe.py`（不随仓库分发）。
-8. 迁移后先跑一次完整的 `auth_test.py`，确认 identification 被接受（accepted）、Now Playing 出现真实曲目名、FT artwork 落盘、`HID_COMMAND=play` 能让 iPod 开始播放。
+8. 迁移后先跑一次完整的 `auth_test.py`，确认 identification 被接受（accepted）、Now Playing 出现真实曲目名、FT artwork 落盘、`HID_COMMAND=play` 能让 iOS device 开始播放。
 ## 8. 重要注意事项
 
 - **证书/私钥是敏感材料**：不要提交到 Git，不要贴到日志、聊天、issue。
 - `ref_iap2_link_layer.py` 是从 wiomoc/iap2 参考并修改的；如果项目要分发，请确认许可证并保留 attribution。当前仅用于开发/测试。
 - 当前 link layer 为了 demo 做了简化：per-packet ACK、容忍一个 seq gap；生产实现应使用完整的 iAP2 重传/窗口逻辑（可参考 DiPlay 的 `Iap2LinkEngine.kt`）。
-- **HID 输入报告必须按 report ID 重组并剥掉 2 字节头**。iPod 的报告格式是 `[report_id][LCB][payload]`，按 size class 补齐；若把报告头混入 iAP2 流，会在大帧中每 766 字节插入 2 字节，造成封面撕裂和“length/checksum 少算”的假象。换固件/机型时先跑 `HID_LOG_RAW=1` 确认 report ID → 总长映射（尤其 1-2 字节尾部是否省略）。
+- **HID 输入报告必须按 report ID 重组并剥掉 2 字节头**。iOS device 的报告格式是 `[report_id][LCB][payload]`，按 size class 补齐；若把报告头混入 iAP2 流，会在大帧中每 766 字节插入 2 字节，造成封面撕裂和“length/checksum 少算”的假象。换固件/机型时先跑 `HID_LOG_RAW=1` 确认 report ID → 总长映射（尤其 1-2 字节尾部是否省略）。
 - **Identification 是脆弱点**：任何新参数加入前，先双向确认 0x1D03 会拒绝哪个 param（设备只给空 payload 的 rejected param id，二分定位）。
 - 如果 VMware USB 直通不稳定，优先在裸机 Linux 或 Raspberry Pi 上测试。
 - pyusb 在 `set_configuration()` 后必须 `dispose_resources()`，否则后续 libhidapi 打不开 HID（早期 observed 过）。

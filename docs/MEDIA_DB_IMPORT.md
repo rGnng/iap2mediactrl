@@ -4,7 +4,7 @@ This is an **out-of-band** importer. It does not touch the iAP2/HID session
 code and `web_app.py` does not import `libimobiledevice`.
 
 ```text
-iPod MediaLibrary.sqlitedb
+iOS device MediaLibrary.sqlitedb
         │  AFC / ifuse
         ▼
 media_db_import.py  ──►  media-db-dates.json
@@ -39,7 +39,7 @@ Device interface (configuration 3 or 4), so the two paths must not run at the
 same time.
 
 1. Stop the web service.
-2. Switch the iPod to configuration 3 or 4.
+2. Switch the iOS device to configuration 3 or 4.
 3. Start usbmuxd as root (the packaged systemd service drops to `usbmux` and may
    not have permission to the USB device node).
 4. Pair/trust the device.
@@ -91,7 +91,7 @@ sudo apt install libimobiledevice-utils ifuse usbmuxd
 ## Safety / limitations
 
 - Read-only: the importer only copies/reads the database; it does not write to
-  the iPod.
+  the iOS device.
 - `date_added` is the device database's date. It may reflect a bulk import/sync
   time and may not distinguish cloud/Apple Music Radio items.
 - Keep the DB snapshot private: it contains library metadata.

@@ -5,7 +5,7 @@
 
 ## 结论
 
-在本项目的语境里，**FT = File Transfer，即 iAP2 的“文件传输”会话（session 12）**，不是 Fourier Transform 之类的缩写。“FT diagram”多半是指画出来的 **FT 文件传输流程时序图**，用来展示 iPod 和 Linux 配件之间在 FT 会话上怎么来回发消息。
+在本项目的语境里，**FT = File Transfer，即 iAP2 的“文件传输”会话（session 12）**，不是 Fourier Transform 之类的缩写。“FT diagram”多半是指画出来的 **FT 文件传输流程时序图**，用来展示 iOS device 和 Linux 配件之间在 FT 会话上怎么来回发消息。
 
 ## FT 会话的基本机制
 
@@ -21,7 +21,7 @@
 ## 一次典型传输的流程（FT diagram 一般画的内容）
 
 ```text
-iPod                                       Linux 配件
+iOS device                                       Linux 配件
     │  Setup  (0x04, 含文件大小8字节+filetype2字节)  │
     │ ─────────────────────────────────────────────▶ │
     │                                        Start  │

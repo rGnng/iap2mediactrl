@@ -1,9 +1,13 @@
 # iap2mediactrl
 
 `iap2mediactrl` is a proof-of-concept (PoC) implementation of an iAP2
-accessory that runs on Linux and controls media playback on an iPod touch over
+accessory that runs on Linux and controls media playback on an iOS device over
 USB HID. It also mirrors the device media library and exposes a browser-based
 control interface.
+
+The terms "iOS device" and "iPod touch" are used deliberately: the former
+refers to the general protocol target, and the latter refers to the specific
+device used for testing.
 
 The project is a protocol reference for a future port to an embedded platform
 with USB host support, such as the ESP32-P4. It is not production firmware, it
@@ -42,7 +46,7 @@ They use different USB configurations and cannot operate at the same time.
 ### Control path
 
 ```text
-iPod touch
+iOS device
   |  USB configuration 2 / HID interface 2 / endpoint 0x83
   v
 hid_async.py             HID report reassembly and asynchronous I/O
@@ -63,7 +67,7 @@ encoding, and library parsing. It can also be executed as a standalone probe.
 ### Out-of-band media database and artwork path
 
 ```text
-iPod touch
+iOS device
   |  USB configuration 3 or 4 (Apple Mobile Device)
   v
 usbmuxd + libimobiledevice + ifuse (AFC)

@@ -235,7 +235,7 @@ if total > 64 and total % 64 <= 2:
     total = (total // 64) * 64   # 设备会省掉 1-2 字节尾部 padding
 ```
 
-这是静态配置，不需要持久化。换 iPod/固件时如果报告长度变化，先看 `HID_LOG_RAW=1`
+这是静态配置，不需要持久化。换 iOS device 或固件时如果报告长度变化，先看 `HID_LOG_RAW=1`
 的原始报告头和 `artifacts/probes/hid_probe.py` 读到的 report descriptor
 （该 probe 是本地开发资料，不随仓库分发）。
 
