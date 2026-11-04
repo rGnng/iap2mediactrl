@@ -9,7 +9,7 @@
 |---|---|---|---|
 | Now Playing（标题/专辑/艺术家/进度/队列/随机/循环） | `STATE["now_playing"]` | 否 | 设备 `0x5001` 推送 |
 | 媒体库信息（MPB / IRTL 两个库的 UUID） | `STATE["libraries"]` | 否 | 设备 `0x4C01` 推送 |
-| 最新封面 JPEG | `STATE["artwork_bytes"]` | 否（当前） | 设备 FT artwork 完成 |
+| 最新封面 JPEG（内存） | `STATE["artwork_bytes"]` | 否 | 设备 FT artwork 完成；磁盘副本见下一行 |
 | 媒体库镜像（20,564 首） | `media-library.json` | **是** | 全量同步 / `0x4C04` 增量 |
 | 条目首次发现时间 | `media-library.json["first_seen"]` | **是** | 新条目首次写入时 |
 | 真实添加时间 | `media-db-dates.json` | **是** | 独立 `media_db_import.py` 读取 `MediaLibrary.sqlitedb` |
@@ -26,8 +26,9 @@
 | 播放历史内存副本 | `HISTORY`（内存） | 是（落盘） | `history_add` |
 | HID report size 映射 | `HIDReader._report_sizes` | 否（启动时计算） | 代码/固件变化时人工确认 |
 
-所有缓存都只在**一个进程**内使用：iAP2 会话线程负责写，HTTP 线程负责读。跨线程用
-`STATE_LOCK`、`LIBRARY_LOCK`、`PLAYLIST_LOCK` 三个互斥锁保护。
+进程内缓存只在**一个进程**内使用：iAP2 会话线程负责写，HTTP 线程负责读。跨线程用
+`STATE_LOCK`、`LIBRARY_LOCK`、`PLAYLIST_LOCK` 三个互斥锁保护。`media-db-dates.json`
+和 `media-db-artwork.json` 由独立导入器生成，Web 服务以只读文件方式加载。
 
 ### 1.1 独立媒体库 DB 导入结果
 
@@ -85,8 +86,10 @@
 ```
 
 - `first_seen` 是 MediaCtrl **首次发现**该条目时的 Unix 时间；旧库条目为 `0.0`。
-  iAP2 媒体库没有“添加日期”字段，因此“最近添加”只能用这个 best-effort 时间。
-  新条目在下一次增量同步时获得真实时间；旧条目不会伪造时间。
+  iAP2 媒体库本身没有“添加日期”字段；当 `media-db-dates.json` 存在时，
+  `library_recent` 优先使用其中的真实 `date_added`，`first_seen` 仅作回退。
+  新条目在下一次增量同步时获得 `first_seen`；随后完成 AFC 导入时可获得数据库中的
+  真实 `date_added`。
 - 该映射独立于 `items`，重新全量同步时不会被清空。
 
 - 当前大小约 **10.7 MB**，20,564 条 + `first_seen` 映射。
@@ -183,7 +186,9 @@ param 2: utf8 库 UUID
 - FT artwork 完成后写 `artwork-cache/<artwork_id>.jpg`（临时文件 + rename）。
 - 最多保留 128 张，按 mtime 淘汰最旧。
 - Now Playing 带 `artwork_id` 且缓存命中时，先显示缓存图；FT 完成后覆盖。
-- 设备不提供媒体库条目的 artwork ID（property 20 实测未下发），因此暂无专辑缩略图。
+- iAP2 不提供媒体库条目的 artwork ID（property 20 实测未下发），因此无法通过 iAP2
+  按条目请求封面；专辑/曲目缩略图由独立 AFC 导入器生成（`media-db-artwork.json`、
+  `media-artwork/thumbs/`），Now Playing 封面仍通过 FT 缓存。
 
 ## 3. 内存缓存
 
@@ -198,7 +203,9 @@ param 2: utf8 库 UUID
 
 `STATE["artwork_bytes"]` 保存最新封面 JPEG（当前 171 KB / 600×600）。HTTP `/api/artwork`
 直接读内存；ETag 用 `artwork_ready_id` 作为查询参数 `?vid=N`，避免浏览器把旧图当新图。
-当前**没有封面磁盘缓存**——重启后需要设备重新发 FT artwork。嵌入式建议见 §5。
+内存中的最新封面不持久化，但 FT 完成时会同时写入 `artwork-cache/<artwork_id>.jpg`；
+收到同一 `artwork_id` 时可从磁盘缓存加载。若设备没有上报 `artwork_id`，无法选择缓存图。
+嵌入式建议见 §5。
 
 ### 3.2 媒体库派生索引
 
@@ -229,7 +236,8 @@ if total > 64 and total % 64 <= 2:
 ```
 
 这是静态配置，不需要持久化。换 iPod/固件时如果报告长度变化，先看 `HID_LOG_RAW=1`
-的原始报告头和 `hid_probe.py` 读到的 report descriptor。
+的原始报告头和 `artifacts/probes/hid_probe.py` 读到的 report descriptor
+（该 probe 是本地开发资料，不随仓库分发）。
 
 ### 3.4 Up Next / 播放历史
 
@@ -279,10 +287,10 @@ if total > 64 and total % 64 <= 2:
 
 ### 仍然限制
 
-- 媒体库条目没有可用的 artwork ID（请求的 MediaItem property 20 实测未下发），
-  因此没有逐专辑/逐曲缩略图。
-- 重启后如果设备没有在 0x5001 里带 `artwork_id`，无法知道该用哪张缓存图；
-  当前只按 ID 命中，不做“按标题猜测”。
+- iAP2 媒体库条目没有可用的 artwork ID（请求的 MediaItem property 20 实测未下发），
+  因此无法通过 iAP2 按条目请求封面；逐专辑/逐曲缩略图改由 AFC 导入器提供。
+- 重启后如果设备没有在 0x5001 里带 `artwork_id`，无法知道该用哪张 Now Playing
+  缓存图；当前只按 ID 命中，不做“按标题猜测”。
 
 ### 建议（嵌入式/长期运行）
 
@@ -296,7 +304,7 @@ if total > 64 and total % 64 <= 2:
 - 所有 API 响应带 `Cache-Control: no-store`，避免代理/浏览器缓存过期状态。
 - 页面每 1 秒轮询 `/api/state`，每 10 秒轮询 `/api/library`。
 - 封面 URL 带 `vid`，图片内容变化时 URL 变化，浏览器不会复用旧图。
-- 本地播放列表/歌曲/艺术家视图按需请求，不在 10 秒轮询里重复拉取。
+- 歌曲/艺术家等视图按需请求，不在 10 秒轮询里重复拉取。
 
 ## 7. 故障恢复清单
 
@@ -322,7 +330,7 @@ if total > 64 and total % 64 <= 2:
      pid INTEGER PRIMARY KEY, title TEXT, album_pid INTEGER, album TEXT,
      artist_pid INTEGER, artist TEXT, album_artist TEXT, genre TEXT,
      composer TEXT, duration_ms INTEGER, track INTEGER, disc INTEGER,
-     media_type INTEGER, rating INTEGER);
+     media_type INTEGER, rating INTEGER, date_added REAL);
    CREATE INDEX idx_items_album ON items(album_pid);
    CREATE INDEX idx_items_artist ON items(artist_pid);
    CREATE INDEX idx_items_title ON items(title COLLATE NOCASE);
@@ -335,6 +343,8 @@ if total > 64 and total % 64 <= 2:
      seq INTEGER PRIMARY KEY AUTOINCREMENT, pid INTEGER, ts REAL);
    ```
    每批 `0x4C04` 用一个事务提交；`PRAGMA journal_mode=WAL`、`synchronous=NORMAL`。
+   `date_added` 由独立导入器 `media_db_import.py` 的结果填充；没有结果时留空，
+   `first_seen` 仅作回退。
 2. **派生索引**（专辑/艺术家/歌曲）用 SQL 视图或启动时构建的数组，不必持久化。
 3. **封面 LRU** 放独立分区，文件名用 artwork ID；写入用 `tmp + rename`，限制总大小。
 4. **revision 单独存 meta 表**；全量同步前先备份数据库文件（SQLite backup API）。

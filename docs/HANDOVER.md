@@ -10,8 +10,8 @@
 4. ✅ **按曲目/专辑/艺术家/专辑艺术家/流派/本地播放列表点播**（0x4C06 / 0x4C07 / 0x4C08）
 5. ✅ 封面——200×200（27,498 字节）与 600×600（186,918 字节）JPEG 均 `djpeg` 零警告、PIL 严格解码；
    封面落盘 LRU 缓存
-6. ✅ Web UI：专辑 / 艺术家 / 专辑艺术家 / 流派 / 歌曲 / 最近添加 / 播放列表七个视图；
-   搜索、分页、排序、Up Next、播放历史、智能列表、播放列表增删改/导入导出、加入播放列表
+6. ✅ Web UI：专辑 / 艺术家 / 专辑艺术家 / 流派 / 歌曲 / 最近添加 / 设备播放列表七个视图；
+   搜索、分页、排序、Up Next、播放历史、智能列表；本地播放列表后端/API 保留，但当前浏览器界面仅展示设备播放列表
 
 当前阶段：**完整可用的控制系统（协议允许范围内）。** 媒体库采用“全量同步 + revision 增量”模型，
 镜像持久化到 `media-library.json`；本地播放列表持久化到 `playlists.json`；播放历史 `history.json`；
@@ -24,9 +24,9 @@
 | 开发机 | `ops@10.0.0.85` |
 | 系统 | Ubuntu，kernel `7.0.0-38-generic`，aarch64 |
 | 虚拟化 | VMware 虚拟机，USB 直通 |
-| 工作目录 | `/home/ops/mediactrl` |
+| 工作目录 | `/home/ops/iap2mediactrl` |
 | Python | 3.14.4 |
-| 虚拟环境 | `/home/ops/mediactrl/.venv`（含 pyusb / hidapi / cryptography / **pillow**） |
+| 虚拟环境 | `/home/ops/iap2mediactrl/.venv`（含 pyusb / hidapi / cryptography / **pillow**） |
 | 权限 | `ops` 可免密 sudo |
 | USB 角色 | Linux 是 USB Host，iPod 是 USB Device |
 | Gadget | 无 `/sys/class/udc`，不能走 USB Device/Gadget 路线 |
@@ -329,8 +329,9 @@ R29 page 376、943–946、465 的流程：
   DateAdded / 添加日期字段。
 - `MediaLibraryCollectionType` 只有 Playlist / Artist / Album / Album Artist / Genre / Composer。
 - `0x4C09` 是 All Songs，不是 Recently Added。
-- 因此 **USB iAP2 没有原生的“最近添加”排序/集合**；只能使用配件侧 `first_seen`
-  近似，或走蓝牙 AVRCP Browsing 的 `Recently Added` 虚拟目录。
+- 因此 **USB iAP2 没有原生的“最近添加”排序/集合**；配件侧 `first_seen` 只能作近似，
+  但独立 AFC 导入器可以读取 `MediaLibrary.sqlitedb.item.date_added`（见 §3.8.3）。
+  蓝牙 AVRCP Browsing 的 `Recently Added` 虚拟目录是另一条可选路径。
 
 当前开发机仍无蓝牙适配器（`/sys/class/bluetooth` 不存在），所以 AVRCP 浏览只能等
 USB dongle 或 btsnoop/HCI 抓包。
@@ -370,27 +371,27 @@ Web UI 的 Recently Added 现在优先使用真实 `date_added`，并在表格�
 
 ## 4. 当前文件
 
-目录：`/home/ops/mediactrl`
+目录：`/home/ops/iap2mediactrl`
 
 | 文件 | 状态 | 说明 |
 |---|---|---|
-| `ipod_probe.py` | 可用 | 枚举 USB、打印 configuration、切 config 2、读 HID report descriptor |
-| `hid_probe.py` | 可用 | 发送 detect marker，读 HID echo（raw libusb SET_REPORT） |
-| `hid_transport.py` | 可用 | pyusb HID transport（自动选 report ID、raw 回调） |
+| `artifacts/probes/ipod_probe.py` | 本地参考 | 枚举 USB、打印 configuration、切 config 2、读 HID report descriptor；不随仓库分发 |
+| `artifacts/probes/hid_probe.py` | 本地参考 | 发送 detect marker，读 HID echo（raw libusb SET_REPORT）；不随仓库分发 |
+| `artifacts/probes/hid_transport.py` | 本地参考 | pyusb HID transport（自动选 report ID、raw 回调）；不随仓库分发 |
 | `hid_async.py` | **已修复（HID 报告重组）** | asyncio HID reader/writer；按 `INPUT_REPORTS` 的 report ID 长度重组报告、剥掉 2 字节 `[report_id][LCB]` 头，只把 payload 交给链路层；`HID_LOG_RAW=1` 调试打印 |
-| `pyusb_hid.py` | 实验性 | 直接 pyusb EP 0x83 传输；`IAP2_TRANSPORT=pyusb` 当前未打通（链路停在 state=0），正式路径仍用 hidapi |
+| `artifacts/probes/pyusb_hid.py` | 本地参考 | 直接 pyusb EP 0x83 传输；`IAP2_TRANSPORT=pyusb` 当前未打通（链路停在 state=0），正式路径仍用 hidapi |
 | `ref_iap2_link_layer.py` | **可用** | 参考 wiomoc 的 iAP2 链路；**FF5A 同步扫描、无 reset()、feed_eof 唤醒**；`pending_ft` / `_fix_csm_length` 作为兜底保留；常量 `FT_SESSION_ID=12`、`file_transfer_handler` 钩子 |
 | `csm.py` | 可用 | CSM 0x4040 编码/解析 |
 | `mfi_local.py` | 可用 | 本地 MFi provider |
 | `auth_test.py` | **可用（全部特性）** | 完整流程：link → auth → identification(含 HID) → 0x5000/0x4C00 → **HID play/pause/next/previous 实测** → **FT artwork 落盘** → 媒体库 0x4C03/0x4C04 实验（`LIB_EXPERIMENT=uuid|uuid+rev|full`）；`HID_COMMAND=play|pause|next|...` 发送控制命令 |
-| `web_app.py` | **可用（常驻 Web UI）** | 后台线程维护 iAP2 会话（断线自动重连）+ HTTP API + 单页控制台；Now Playing/封面/专辑/艺术家/歌曲/播放列表/音量/随机/循环 |
+| `web_app.py` | **可用（常驻 Web UI）** | 后台线程维护 iAP2 会话（断线自动重连）+ HTTP API + 单页控制台；Now Playing/封面/专辑/艺术家/歌曲/设备播放列表/音量/随机/循环 |
 | `run_web.sh` | 可用 | 启动 Web UI 的包装脚本（`PORT=8080 ./run_web.sh`） |
 | `docs/CACHE.md` | 文档 | 缓存/持久化机制、失效规则、嵌入式建议 |
-| `docs/reference/788716769-Accessory-Interface-Specification-R29.pdf` | 参考 | Apple R29 全文（1019 页）；0x4C09、队列 FT、MediaItem 属性表的权威依据 |
+| `docs/reference/788716769-Accessory-Interface-Specification-R29.pdf` | 本地参考 | Apple R29 全文（1019 页）；0x4C09、队列 FT、MediaItem 属性表的权威依据；不纳入 Git |
 | `media_db_import.py` | **独立工具** | 通过 ifuse/AFC 读取 `MediaLibrary.sqlitedb`，生成 `media-db-dates.json`；不导入 iAP2/HID 代码 |
 | `docs/MEDIA_DB_IMPORT.md` | 文档 | 媒体库 DB 独立导入说明、命令、结果格式 |
-| `media-db-dates.json` | 数据 | 独立导入结果：20,564 个 PID → 真实 date_added |
-| `artifacts/media-db-snapshot/` | 数据 | 只读 SQLite 快照（约 49MB）；含隐私元数据，勿公开 |
+| `media-db-dates.json` | 数据 | 独立导入结果：20,688 个 PID；20,564 个匹配当前镜像 |
+| `artifacts/media-db-snapshot/` | 数据 | 只读 SQLite 快照（约 49MB）；含隐私元数据，勿公开；不纳入 Git |
 | `media_db_artwork_import.py` | **独立工具** | 通过 AFC 读取 `iTunes/Artwork/Originals`，生成 `media-db-artwork.json` 和本地缩略图 |
 | `media-db-artwork.json` | 数据 | 20,629 个 item / 2,090 个 album 的封面映射 |
 | `media-artwork/` | 数据 | 2,187 张原始封面（1.34GB）+ 2,179 张 160px 缩略图 |
@@ -399,33 +400,36 @@ Web UI 的 Recently Added 现在优先使用真实 `date_added`，并在表格�
 | `playlists.json` | 数据 | 配件侧本地播放列表（iAP2 媒体库只读，不能改设备端列表） |
 | `history.json` | 数据 | 最近 500 次播放记录（智能列表/Up Next 历史） |
 | `artwork-cache/` | 数据 | 封面磁盘缓存（最多 128 张，LRU） |
-| `link_probe.py` | 失败/参考 | 自己写的 link probe，未用 |
-| `syn_debug.py` | 失败/参考 | 原始 SYN 调试 |
-| `wiomoc_link_test.py` | 可用/参考 | wiomoc link layer 参考 |
+| `artifacts/probes/link_probe.py` | 本地参考 | 早期 link probe，未用；不随仓库分发 |
+| `artifacts/probes/syn_debug.py` | 本地参考 | 原始 SYN 调试；不随仓库分发 |
+| `artifacts/probes/wiomoc_link_test.py` | 本地参考 | wiomoc link layer 参考；不随仓库分发 |
 | `artifacts/logs/hid-test-01..07.log` | 日志 | HID component 0x0012 识别 → StartHID → **play/pause/next/previous 全部实测** |
 | `artifacts/logs/media-library-01..15.log` | 日志 | 媒体库调试全过程（含 4C01 原始 TLV、4C03/4C04、FT artwork 过程） |
 | `artifacts/logs/media-library-06/10/13.log` | 日志 | **HID 帧实验：URB 原始字节 dump**（`HID_LOG_RAW=1`），确定了 iPod 的 URB 分帧方式 |
-| `media-library-body-4c01.bin` / `-4c04.bin` | dump | 媒体库原始 body（4C01 含两库 UUID/修订号；4C04 含修订信息） |
-| `artwork-*.jpg` | 产物/调试 | 干净版：`artwork-251.jpg`（200×200，27,498B）、`artwork-600-clean.jpg`（600×600，186,918B）；旧文件保留为不同阶段的撕裂样本 |
+| `artifacts/captures/media-library-body-4c01.bin` / `-4c04.bin` | dump | 媒体库原始 body（4C01 含两库 UUID/修订号；4C04 含修订信息） |
+| `artifacts/artwork/artwork-251.jpg` / `artwork-600-clean.jpg` | 产物/调试 | 干净版：200×200，27,498B；600×600，186,918B；旧文件保留为不同阶段的撕裂样本 |
 
 ## 5. 如何运行
 
 ```bash
-cd /home/ops/mediactrl
+cd /home/ops/iap2mediactrl
 source .venv/bin/activate
 ```
 
 ### 5.1 只读 USB 描述符
 
 ```bash
-sudo .venv/bin/python ipod_probe.py
+sudo .venv/bin/python artifacts/probes/ipod_probe.py
 ```
 
 ### 5.2 HID marker 测试
 
 ```bash
-sudo .venv/bin/python hid_probe.py
+sudo .venv/bin/python artifacts/probes/hid_probe.py
 ```
+
+`artifacts/probes/` 是本地开发资料，不随仓库分发；新环境可直接使用
+`auth_test.py` 完成完整流程。
 
 ### 5.3 完整流程（认证 + 识别 + Now Playing + HID + 封面 + 媒体库）
 
@@ -448,7 +452,7 @@ sudo .venv/bin/python auth_test.py
 ### 5.4 Web UI（常驻）
 
 ```bash
-cd /home/ops/mediactrl
+cd /home/ops/iap2mediactrl
 ./run_web.sh                 # 默认 8080，后台服务另开终端；Ctrl+C 停止
 # 或：PORT=9000 ./run_web.sh
 ```
@@ -465,12 +469,12 @@ cd /home/ops/mediactrl
   - **专辑艺术家**：1,059 位（可搜索/分页），点条目 → 专辑列表；
   - **流派**：168 个（可搜索/分页），点流派 → 专辑列表；
   - **歌曲**：20,564 首（可搜索/分页），支持按标题/艺术家/专辑/时长/最近添加排序；
-  - **最近添加**：按 MediaCtrl 首次发现时间；iAP2 不提供“添加日期”，旧库条目不显示；
+  - **最近添加**：优先使用 `media-db-dates.json` 中的真实 `date_added`；未导入结果时回退到 `first_seen`，旧库条目可能不显示；
   - **设备播放列表**：只读，可查看/播放；本地播放列表 UI 暂时移除。
 - **Up Next**：优先显示设备真实队列（FT 0x0003/0x0006）；网页发起的本地列表播放也会更新队列，
   显示当前及接下来曲目（点击可单曲播放）。
 - **播放历史**：`history.json` 记录最近 500 次曲目变化；生成“最近播放”“最常播放”智能列表。
-- **加入播放列表**：歌曲/专辑曲目行内 `＋`；专辑支持“整张加入”；弹窗可新建并同时加入。
+- **本地播放列表**：后端和 HTTP API 保留；当前浏览器界面不提供创建/编辑入口。
 - **播放**：单曲 `0x4C07`；整张专辑/艺术家 `0x4C08`（CollectionType=2/1）；
   流派/专辑艺术家用 `0x4C07` 有序 PID 列表；本地播放列表 `0x4C07`；
   恢复 iPod 当前队列 `0x4C06`。队列信息由 0x5001 回传。
@@ -491,7 +495,7 @@ HTTP API：
 | GET | `/api/library/album-artist?name=...` | 某专辑艺术家的专辑列表 |
 | GET | `/api/library/genres?q=&limit=&offset=` | 流派列表 |
 | GET | `/api/library/genre?name=...` | 某流派的专辑列表 |
-| GET | `/api/library/recent?limit=&offset=` | 最近添加（best-effort，见 note 字段） |
+| GET | `/api/library/recent?limit=&offset=` | 最近添加（优先 `date_added`，回退 `first_seen`；见 `note` 字段） |
 | GET | `/api/library/songs?q=&limit=&offset=&sort=` | 歌曲列表；sort=title/artist/album/duration/recent |
 | GET | `/api/queue` | 队列快照（设备队列或本地队列；当前 + 接下来） |
 | GET | `/api/history?limit=` | 最近播放 |
@@ -560,12 +564,12 @@ HID report descriptor 12 bit（`B0 B1 B5 B6 B9 BC E9 EA E2 B7 B3 B4`，2 字节 
 
 ### 6.4 Web UI / 播放列表
 
-- 七个标签页：专辑 / 艺术家 / 专辑艺术家 / 流派 / 歌曲 / 最近添加 / 播放列表；
+- 七个标签页：专辑 / 艺术家 / 专辑艺术家 / 流派 / 歌曲 / 最近添加 / 设备播放列表；
 - 专辑/艺术家/专辑艺术家/流派：点条目 → 专辑 → 曲目；歌曲：点歌曲即播放；
 - 歌曲排序：标题 / 艺术家 / 专辑 / 时长 / 最近添加；
 - 设备播放列表：只查看/播放；本地播放列表 UI 已移除；
 - 智能列表：最近播放 / 最常播放（来自 `history.json`）；
-- 加入播放列表：歌曲/专辑曲目行内 `＋`；专辑支持“整张加入”；弹窗可新建并同时加入；
+- 本地播放列表：后端和 HTTP API 保留；当前浏览器界面不提供创建/编辑入口；
 - Up Next：设备真实队列（FT 0x0003/0x0006）+ 网页发起的本地有序队列；
 - 播放：单曲 0x4C07、专辑 0x4C08 type=2、艺术家 0x4C08 type=1、
   流派/专辑艺术家/本地列表 0x4C07 有序 blob、继续当前队列 0x4C06；
@@ -576,10 +580,11 @@ HID report descriptor 12 bit（`B0 B1 B5 B6 B9 BC E9 EA E2 B7 B3 B4`，2 字节 
   - 专辑艺术家 #ffffff Records 队列 `0/6`；
   - 单曲播放队列 `0/1`，Up Next/历史正常。
 
-**最近添加的限制：** iAP2 媒体库没有“添加日期”字段（MediaItem property 0–20 无日期）。
-`library_recent` 只能记录 MediaCtrl **首次发现**条目的时间；旧库条目为 0，不显示。
-新加入 iPod 的曲目会在下一次增量同步时获得真实时间并出现在“最近添加”和
-`songs?sort=recent` 顶部。UI 会显示这条说明。
+**最近添加的数据来源：** iAP2 媒体库没有原生的“添加日期”字段（MediaItem property 0–20
+无日期）。`library_recent` 优先读取独立导入器生成的 `media-db-dates.json`
+（`item.date_added`）；未导入时回退到 **首次发现** 时间 `first_seen`，旧库条目可能没有
+时间而不显示。新加入 iPod 的曲目会在下一次增量同步时获得 `first_seen` 时间；如果随后
+完成 AFC 导入，则使用数据库中的真实 `date_added`。UI 的 `note` 字段会说明当前数据来源。
 
 ### 6.5 封面
 
@@ -592,9 +597,9 @@ HID report descriptor 12 bit（`B0 B1 B5 B6 B9 BC E9 EA E2 B7 B3 B4`，2 字节 
 - **进度 seek/scrub**：Now Playing 只给 elapsed，没有 seek 命令；HID Fast Forward/Rewind
   （0xB3/0xB4）已加入 descriptor，但短按被设备当作 next/previous，长按 seek 未验证。
 - **“添加日期”/Recently Added 原始字段**：iAP2 MediaItem property 0–20 没有日期；
-  当前“最近添加”是 MediaCtrl 首次发现时间（旧库无历史时间）。未接入设备原生
-  Recently Added 特殊集合（见下）。
-- **设备端播放列表编辑**：iAP2 媒体库只读；当前用配件侧本地播放列表替代。
+  当前“最近添加”优先使用 AFC 导入的 `MediaLibrary.sqlitedb.item.date_added`，
+  未导入时回退到 `first_seen`。未接入设备原生 Recently Added 特殊集合（见下）。
+- **设备端播放列表编辑**：iAP2 媒体库只读；配件侧本地播放列表仅保留在后端/API。
 - **设备播放列表内容**：已打通！FT file type **0x0004** 是扁平 u64 PID 数组；
   `MediaPlaylistProperties` 必须请求合法 ID 0–5（尤其是 5 = FT identifier）。
   当前设备有 `PlaylistSync`（42 首），可查看/播放；设备端只读。
@@ -607,7 +612,9 @@ HID report descriptor 12 bit（`B0 B1 B5 B6 B9 BC E9 EA E2 B7 B3 B4`，2 字节 
   `[媒体库 UUID][AllSongs none][起始 PID]`，是“播放全部歌曲”，不是 Recently Added；
   未做 UI 入口（避免误触发全库播放）。
 - **逐曲/专辑封面缩略图**：MediaItem 设备数据里没有 property 20 的 artwork ID
-  （实测只发 0–19 和 25）；无法按条目请求 FT，只缓存 Now Playing 封面。
+  （实测只发 0–19 和 25），因此无法通过 iAP2 按条目请求封面；Now Playing 封面仍走 FT。
+  媒体库专辑/曲目缩略图由独立 AFC 导入器 `media_db_artwork_import.py` 生成，
+  存放在 `media-artwork/` 与 `media-db-artwork.json`。
 - **电池百分比**：`0xAE01 PowerUpdate` 只有 accessory power mode，没有设备电池电量。
 - **设备信息/时间/语言通知**：0x4E09–0x4E0C 存在，但当前未加入 identification 的
   received 列表（避免识别风险）；价值低，未接入。
@@ -630,7 +637,7 @@ HID report descriptor 12 bit（`B0 B1 B5 B6 B9 BC E9 EA E2 B7 B3 B4`，2 字节 
 
 ## 7. 迁移到新 agent 的检查清单
 
-1. 复制整个 `/home/ops/mediactrl` 到新机器（**不要复制 `iap2cert` 到任何不安全位置**）。
+1. 复制整个 `/home/ops/iap2mediactrl` 到新机器（**不要复制 `iap2cert` 到任何不安全位置**）。
 2. 复制 `/home/ops/iap2cert` 到新机器，或修改 `auth_test.py` 的 `CERT_PATH` / `KEY_PATH`。
 3. 安装系统包：
 
@@ -645,9 +652,9 @@ sudo apt install -y \
 4. 重建 venv：
 
 ```bash
-cd /home/ops/mediactrl
+cd /home/ops/iap2mediactrl
 python3 -m venv .venv
-.venv/bin/pip install pyusb hidapi cryptography pillow
+.venv/bin/pip install -r requirements.txt
 ```
 
 5. 确认 iPod 已直通到 Linux：
@@ -658,7 +665,8 @@ lsusb -t
 ```
 
 6. 用 root 或配置 udev 权限运行 USB/HID 操作。
-7. 先跑 `ipod_probe.py`，再跑 `hid_probe.py`，最后 `auth_test.py`。
+7. 先跑 `auth_test.py`。如需底层调试，再运行本地的
+   `artifacts/probes/ipod_probe.py` 和 `artifacts/probes/hid_probe.py`（不随仓库分发）。
 8. 迁移后先跑一次完整的 `auth_test.py`，确认 identification 被接受（accepted）、Now Playing 出现真实曲目名、FT artwork 落盘、`HID_COMMAND=play` 能让 iPod 开始播放。
 ## 8. 重要注意事项
 

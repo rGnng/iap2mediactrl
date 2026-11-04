@@ -34,12 +34,12 @@ missing.
 
 ## Usage
 
-The iAP2 service uses USB configuration 2 (HID). AFC needs the Apple Mobile
-Device interface (configuration 3), so the two paths must not run at the same
-time.
+The iAP2 service uses USB configuration 2 (HID). AFC uses the Apple Mobile
+Device interface (configuration 3 or 4), so the two paths must not run at the
+same time.
 
 1. Stop the web service.
-2. Switch the iPod to configuration 3.
+2. Switch the iPod to configuration 3 or 4.
 3. Start usbmuxd as root (the packaged systemd service drops to `usbmux` and may
    not have permission to the USB device node).
 4. Pair/trust the device.

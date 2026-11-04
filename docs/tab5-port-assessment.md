@@ -3,7 +3,7 @@
 > 评估对象：本目录的 iAP2 配件实现（`auth_test.py`、`web_app.py`、
 > `ref_iap2_link_layer.py`、`hid_async.py`、`csm.py`、`mfi_local.py`）。
 > 目标硬件：M5Stack Tab5（ESP32-P4 + ESP32-C6）。
-> 评估日期：2026-11-03。
+> 评估日期：2026-11-03；媒体库同步与 HID 报告结论于 2026-11-04 更新。
 
 ## 结论
 
@@ -22,12 +22,12 @@ Tab5 是 **ESP32-P4 单片机**（360 MHz 双核 RISC-V、32 MB PSRAM、
 - pyusb / hidapi（Linux USB Host）
 - cryptography（MFi P-256 签名）
 - http.server（Web UI）
-- Pillow（仅用于封面验证）
+- Pillow（封面验证与缩略图生成）
 
 这些在 Tab5 上都没有现成对应物。MicroPython 虽然有 ESP32-P4 移植，但
 **没有 USB Host 栈**，也没有 pyusb/hidapi/cryptography，不能作为捷径。
-所以必须用 ESP-IDF 重写；核心 Python 约 1,300 行，C 版本预计
-4,000–6,000 行。
+所以必须用 ESP-IDF 重写；核心协议代码约 1,500 行，Web UI/媒体库逻辑约 4,400 行，
+C 版本预计 4,000–6,000 行（不含完整 UI）。
 
 ## 2. 硬件核对：很合适
 
@@ -65,9 +65,9 @@ Tab5 是 **ESP32-P4 单片机**（360 MHz 双核 RISC-V、32 MB PSRAM、
 | 链路层 | Python asyncio | C/FreeRTOS，逻辑可照搬；注意 RTOS 并发与缓冲 |
 | CSM | `csm.py` | C 版 TLV 编解码，逻辑简单 |
 | MFi | cryptography P-256 | mbedTLS ECDSA P-256；证书/私钥预置，Flash 加密 |
-| 封面 | Pillow 验证 | P4 硬件 JPEG 解码 + PSRAM 缓冲 |
+| 封面 | Pillow 验证/缩略图 | P4 硬件 JPEG 解码 + PSRAM 缓冲 |
 | UI | 浏览器 HTML | Tab5 没有浏览器；用 LVGL 重写，或继续由手机/PC 访问 Tab5 提供的 Web UI |
-| 媒体库 | 4C01/4C04 | 同样只到库信息/修订号；专辑列表仍未解 |
+| 媒体库 | 4C01/4C04 | 已实现全量/增量同步与专辑/艺术家/歌曲索引；Tab5 上需用 SQLite/分页持久化，不能照搬整库 JSON |
 
 ## 5. 真正的风险点
 
@@ -78,8 +78,11 @@ Tab5 是 **ESP32-P4 单片机**（360 MHz 双核 RISC-V、32 MB PSRAM、
    发送方式不标准，标准 HID class driver 可能不适用。建议绕过 HID 驱动，
    直接 claim interface 2，用 control transfer 发 `SET_REPORT`，用
    interrupt transfer 读 `0x83`。
-3. **FT 帧的坑要原样保留**：length 少 10 字节、>64 KB 饱和到 `0xFFFF`、
-   checksum 不标准——这些 Python 里已经处理，C 重写不能“顺手修正”。
+3. **HID 报告头必须剥离**：iPod 的每个输入报告包含 `[report_id][LCB]` 和填充；
+   如果把报告头当成 iAP2 字节流，会在大帧中每 766 字节插入 2 字节，表现为 FT
+   length/checksum 错误和封面撕裂。剥头后 link length 和 checksum 是标准的；
+   >64 KB 的 FT 数据报会拆成多个 link 帧，每帧 `length=0xFFFF`。C 重写必须保留
+   报告重组，不能把原始 URB 直接拼接。
 4. **链路层是实验级**：现在是 per-packet ACK、容忍一个 seq gap，没有
    完整窗口/重传。RTOS 并发和 USB Host 回调时序与 asyncio 不同，可能
    暴露竞态，生产前要补状态机。
@@ -87,8 +90,9 @@ Tab5 是 **ESP32-P4 单片机**（360 MHz 双核 RISC-V、32 MB PSRAM、
    负载开关，带 iPod 应该可以，但电池续航会明显下降。
 6. **MFi 证书**：这是 NDA 开发证书。Tab5 上建议开 Flash 加密/NVS 加密，
    但它仍然不是“已获 MFi 认证的产品”，对外销售要先解决授权。
-7. **媒体库专辑列表仍未解**：4C01/4C04 只到库信息和修订号，专辑列表是
-   协议逆向问题，换 Tab5 不会自动解决。
+7. **媒体库数据量和持久化**：完整媒体库同步已实现（20,564 首），但 4C04 数据量大，
+   Tab5 上需要用 SQLite/分页并处理 WAL/掉电安全；AFC 数据库约 50 MB，不能放入
+   16 MB Flash 或 32 MB PSRAM。
 8. **Web UI 不能直接显示**：Tab5 没有浏览器。要么用 LVGL 重写，要么把
    现有 HTML 通过 Wi-Fi 给手机/PC 看；后者 Tab5 只当服务器。
 

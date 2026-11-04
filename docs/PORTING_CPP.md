@@ -4,6 +4,9 @@
 （ARM Cortex-A7/A53、128–512 MB RAM、只读 rootfs + 可写数据分区）。不是逐行翻译指南，
 而是把协议层、缓存层和 UI 层拆成可测试的 C++ 模块。
 
+> 目标平台说明：本文针对嵌入式 Linux。ESP32-P4 / M5Stack Tab5 的重写评估见
+> `tab5-port-assessment.md` 与 `tab5-afc-db-pull-feasibility.md`。
+
 最后更新：2026-11-04。
 
 ## 1. 目标与约束
