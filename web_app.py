@@ -964,6 +964,7 @@ def switch_library(library_id, name=None):
         LAST_HISTORY["id"] = None
         LAST_HISTORY["ts"] = 0.0
     load_playlists()
+    load_media_artwork()
     print(f"active library: {library_id} ({name or 'unknown'}), "
           f"{len(data['items'])} items", flush=True)
 
@@ -3899,7 +3900,6 @@ button .bi { font-size: 1.15em; }
         <div class="media-section">
           <div class="kv"><span>Artwork cache</span><span id="media-artwork-state">Not loaded</span></div>
           <div class="media-actions">
-            <button id="media-load-artwork">Load Artwork</button>
             <button id="media-update-artwork">Update Artwork</button>
           </div>
         </div>
@@ -4328,7 +4328,6 @@ function renderMedia(media, settings) {
   $("#media-full").disabled = busy;
   $("#media-load-library").disabled = busy || !cache.cache_db;
   $("#media-update-library").disabled = busy;
-  $("#media-load-artwork").disabled = busy || !cache.cache_db;
   $("#media-update-artwork").disabled = busy;
   $("#media-switch-iap2").disabled = busy || media.mode === "iap2";
   $("#media-clear").disabled = busy;
@@ -5555,7 +5554,6 @@ $("#media-full").onclick = () => {
 };
 $("#media-load-library").onclick = () => mediaLoad("library");
 $("#media-update-library").onclick = () => mediaAction("db");
-$("#media-load-artwork").onclick = () => mediaLoad("artwork");
 $("#media-update-artwork").onclick = () => mediaAction("artwork");
 $("#media-clear").onclick = () => {
   if (confirm("Clear this device's AFC cache: MediaLibrary database " +
@@ -6109,6 +6107,11 @@ def main():
                 base_dir=BASE_DIR)
         except Exception as exc:  # noqa: BLE001
             print(f"media cache initialization failed: {exc}")
+    if os.path.exists(cache_path):
+        try:
+            load_media_cache("artwork")
+        except Exception as exc:  # noqa: BLE001
+            print(f"artwork cache load failed: {exc}")
     SESSION.start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.daemon_threads = True

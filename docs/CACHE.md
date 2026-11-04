@@ -49,10 +49,11 @@
   默认停留在 MediaLibrary 模式；只有勾选自动切换（`settings.json` 的
   `auto_switch_iap2`）时才恢复 configuration 2 并重启 iAP2。
 
-### 1.2 手动加载与清理
+### 1.2 缓存加载与清理
 
-- Web 启动时**不加载** `dates`/`artwork` 到内存；普通库请求也不会自动加载。
-- `Load MediaLibrary` / `Load Artwork` 只读当前设备的 `media-cache.db`。
+- Web 启动时，如果当前设备的 `media-cache.db` 存在，会自动把 `artwork` 映射
+  加载到内存；切换到其他设备库时也会自动加载。普通的库请求不会重复加载。
+- `dates` 仍需手动点击 `Load MediaLibrary` 加载。
 - `Update MediaLibrary` / `Update Artwork` 会从设备更新，并加载更新后的结果。
 - `Clear AFC Cache` 删除当前设备的 `media-cache.db`、`media-artwork/`、
   `snapshot/`，并卸载内存中的日期/封面；`iap2.db` 和 `artwork-cache/` 保留。

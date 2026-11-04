@@ -133,18 +133,18 @@ columns and all action buttons are text-only.
   for the Trust dialog.
 - `Load MediaLibrary` / `Update MediaLibrary` — load the existing `dates`
   table, or pull a fresh database snapshot and update it.
-- `Load Artwork` / `Update Artwork` — load the existing artwork mapping, or
-  refresh the mapping and copy missing/changed artwork.
+- `Update Artwork` — refresh the artwork mapping and copy missing/changed
+  artwork. Existing artwork mappings are loaded automatically when the cache
+  is present.
 - `Quick Sync` — update both AFC caches incrementally.
 - `Full Refresh` — update the database and delete/re-download every cover.
 - `Clear AFC Cache` — remove `media-cache.db`, `media-artwork/`, and
   `snapshot/` for the active device. The iAP2 database and artwork are kept.
 - `Cancel` — stop the running AFC task.
 
-Cache loading is manual. The web process does not load dates or artwork at
-startup and does not reload them on ordinary library requests. Clicking an
-`Update` action loads the updated result; clicking `Load` reads an existing
-local cache without touching the device.
+The dates cache is loaded manually with `Load MediaLibrary`. Artwork is loaded
+automatically at startup and when the active library changes; `Update Artwork`
+reloads it after pulling. Neither automatic load talks to the device.
 
 ### Right: iAP2
 

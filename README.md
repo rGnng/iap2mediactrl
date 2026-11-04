@@ -384,15 +384,17 @@ The browser interface provides:
   assembled locally and sent as a new ordered list when played.
 - Library status, revision, session state, and a resynchronization action.
 - A two-column `MediaLibrary` panel: AFC on the left, iAP2 on the right.
-  AFC side: `Pair / Trust`, manual cache load/update, `Quick Sync`,
-  `Full Refresh`, `Clear AFC Cache`. iAP2 side: `Sync iAP2`, `Full Resync`,
+  AFC side: `Pair / Trust`, manual dates cache load/update, automatic artwork
+  cache load, `Update Artwork`, `Quick Sync`, `Full Refresh`,
+  `Clear AFC Cache`. iAP2 side: `Sync iAP2`, `Full Resync`,
   `Clear iAP2 Library`, `Clear iAP2 Artwork`, `Switch to iAP2`.
-  Cache loading is manual. `Auto switch to iAP2 after AFC tasks` is off by
-  default and persisted in `settings.json`. All `MediaLibrary` action buttons
-  are text-only. Bootstrap Icons are vendored under `static/bootstrap-icons/`;
-  the page loads no external CDN assets. Browser tabs are icon-only, with the
-  search field to their right. Album and song sort controls share the same
-  select-based toolbar.
+  Artwork mappings load automatically at startup and when the active library
+  changes; the dates cache remains manual. `Auto switch to iAP2 after AFC
+  tasks` is off by default and persisted in `settings.json`. All `MediaLibrary`
+  action buttons are text-only. Bootstrap Icons are vendored under
+  `static/bootstrap-icons/`; the page loads no external CDN assets. Browser
+  tabs are icon-only, with the search field to their right. Album and song sort
+  controls share the same select-based toolbar.
 
 The web interface does not implement authentication. It binds to `0.0.0.0` and
 should only be exposed on a trusted network.
