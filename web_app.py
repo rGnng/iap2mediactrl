@@ -200,6 +200,9 @@ MAX_PLAYLIST_ITEMS = 2000
 QUEUE_LOCK = threading.Lock()
 QUEUE = {"items": [], "source": "", "updated": 0.0,
          "base": 0, "meta": {}}
+# Editable accessory-side queue.  It is shown in Up Next while non-empty and
+# sent to the device as one ordered list when the user presses Play queue.
+QUEUE_BUILDER = {"items": [], "updated": 0.0}
 LAST_HISTORY = {"id": None, "ts": 0.0}
 
 
@@ -495,6 +498,35 @@ def set_queue(item_ids, source="", base=0, meta=None):
         QUEUE["meta"] = dict(meta or {})
 
 
+def queue_add(item_ids):
+    """Append known library items to the editable Up Next queue."""
+    ids = [str(x) for x in (item_ids or []) if x]
+    with LIBRARY_LOCK:
+        known = {item_id: LIBRARY["items"].get(item_id)
+                 for item_id in ids}
+    valid = [item_id for item_id in ids if known.get(item_id) is not None]
+    missing = len(ids) - len(valid)
+    if not valid:
+        with QUEUE_LOCK:
+            return 0, missing, len(QUEUE_BUILDER["items"])
+    with QUEUE_LOCK:
+        QUEUE_BUILDER["items"].extend(valid)
+        QUEUE_BUILDER["updated"] = time.time()
+        total = len(QUEUE_BUILDER["items"])
+    return len(valid), missing, total
+
+
+def queue_clear():
+    with QUEUE_LOCK:
+        QUEUE_BUILDER["items"] = []
+        QUEUE_BUILDER["updated"] = time.time()
+
+
+def queue_builder_ids():
+    with QUEUE_LOCK:
+        return list(QUEUE_BUILDER["items"])
+
+
 def _resolve_items(item_ids, fallback=None):
     with LIBRARY_LOCK:
         by_id = {item_id: LIBRARY["items"].get(item_id)
@@ -606,10 +638,24 @@ def library_device_playlist(pl_id):
 
 def queue_snapshot(limit=20):
     with QUEUE_LOCK:
+        builder_ids = list(QUEUE_BUILDER["items"])
         ids = list(QUEUE["items"])
         source = QUEUE["source"]
         base = QUEUE.get("base", 0)
         meta = dict(QUEUE.get("meta") or {})
+    if builder_ids:
+        try:
+            limit = max(1, int(limit))
+        except (TypeError, ValueError):
+            limit = 20
+        window = builder_ids[:max(limit, 50)]
+        return {
+            "source": "queued",
+            "index": 0,
+            "base_index": 0,
+            "total": len(builder_ids),
+            "items": _resolve_items(window),
+        }
     with STATE_LOCK:
         np = dict(STATE["now_playing"])
     index = np.get("queue_index")
@@ -2932,6 +2978,8 @@ input::placeholder { color: var(--text-4); }
 .upnext-row .a { color: var(--text-3); font-size: var(--fs-micro); }
 .upnext-row.cur { background: var(--surface-3); }
 .queue-panel .upnext { max-height: 180px; }
+.queue-actions { display: flex; gap: 6px; margin: 0 0 6px; }
+.queue-actions .small-btn { flex: 1 1 0; height: 24px; }
 
 /* ---- library panel / tabs / search ------------------------------------ */
 .library-panel {
@@ -3176,7 +3224,7 @@ input:not([type="checkbox"]):focus,
 }
 .media-table .col-index { width: 40px; }
 .media-table .date-col { width: 86px; color: var(--text-4); }
-.media-table .actions { width: 104px; text-align: right; }
+.media-table .actions { width: 116px; text-align: right; }
 .media-table th.title,
 .media-table th.artist,
 .media-table th.album-col,
@@ -3359,10 +3407,10 @@ input:not([type="checkbox"]):focus,
 .modal-close { width: 100%; height: 30px; margin-top: 12px; font-size: var(--fs-meta); }
 .toast {
   position: fixed;
-  left: 50%;
+  right: 24px;
   bottom: 24px;
   z-index: 100;
-  transform: translateX(-50%);
+  max-width: calc(100vw - 48px);
   padding: 9px 14px;
   border: 1px solid var(--line-strong);
   background: var(--surface-3);
@@ -3406,7 +3454,7 @@ button .bi { font-size: 1.15em; }
   .media-table td { padding: 7px 8px; }
   .media-table .num { width: 52px; }
   .media-table .date-col { width: 78px; }
-  .media-table .actions { width: 92px; }
+  .media-table .actions { width: 104px; }
   .detail-head .s { margin-right: 0; }
 }
 </style>
@@ -3467,6 +3515,10 @@ button .bi { font-size: 1.15em; }
       <div class="panel-head">
         <h3>Up Next</h3>
         <span class="panel-note" id="upnext-note"></span>
+      </div>
+      <div class="queue-actions" id="queue-actions" style="display:none">
+        <button id="btn-play-queue" class="small-btn main" title="Play queued tracks"><i class="bi bi-play-fill"></i> Play queue</button>
+        <button id="btn-clear-queue" class="small-btn" title="Clear queue"><i class="bi bi-x-lg"></i> Clear</button>
       </div>
       <div class="upnext" id="upnext"></div>
     </div>
@@ -3588,7 +3640,8 @@ button .bi { font-size: 1.15em; }
           <img class="detail-cover" id="detail-cover" alt="">
           <div class="t" id="detail-title"></div>
           <div class="s" id="detail-sub"></div>
-          <button id="btn-play-detail"><i class="bi bi-play-fill"></i> Play</button>
+          <button id="btn-queue-detail" title="Add to queue"><i class="bi bi-plus-lg"></i> Queue</button>
+          <button id="btn-play-detail" class="main"><i class="bi bi-play-fill"></i> Play</button>
           <button id="btn-detail-close"><i class="bi bi-x-lg"></i> Close</button>
         </div>
         <div class="detail-actions" id="detail-actions"></div>
@@ -3808,13 +3861,21 @@ function render(s) {
   $("#np-details").textContent = details.join(" · ");
 
   const q = s.queue || {items: []};
-  $("#upnext-note").textContent = q.source === "device"
-      ? "Device queue" : (q.total ? "Local queue" : "");
+  const queued = q.source === "queued";
+  $("#queue-actions").style.display = queued && q.total ? "flex" : "none";
+  $("#btn-play-queue").disabled = !(connected && linkOk);
+  if (queued) {
+    $("#upnext-note").textContent =
+        `Queued · ${q.total} ` + (q.total === 1 ? "track" : "tracks");
+  } else {
+    $("#upnext-note").textContent = q.source === "device"
+        ? "Device queue" : (q.total ? "Local queue" : "");
+  }
   if (q.items && q.items.length) {
     const qbase = q.base_index || 0;
     $("#upnext").innerHTML = q.items.map((t, i) => `
-        <div class="upnext-row ${i === 0 ? "cur" : ""}"
-             data-id="${esc(t.id)}">
+        <div class="upnext-row ${!queued && i === 0 ? "cur" : ""}"
+             data-id="${esc(t.id)}" data-index="${i}">
           <span class="i">${qbase + (q.index || 0) + i + 1}</span>
           <span class="t">${esc(t.title)}
             <div class="a">${esc(t.artist)}</div></span>
@@ -4548,6 +4609,8 @@ function trackRow(t, idx, actions, withDate) {
       ${withDate ? `<td class="num date-col">${fmtDate(t.date_added)}</td>` : ""}
       <td class="actions">
         ${actions || ""}
+        <button class="icon-btn" data-queue="1" title="Add to queue"
+                aria-label="Add to queue"><i class="bi bi-plus-lg"></i></button>
         <span class="play" title="Play"><i class="bi bi-play-fill"></i></span>
       </td>
     </tr>`;
@@ -4569,6 +4632,9 @@ function showDetail() {
     cover.style.display = "none";
     cover.removeAttribute("src");
   }
+  const canQueue = !!(d && (d.type === "album" || d.type === "playlist" ||
+      d.type === "device-playlist") && (d.items || []).length);
+  $("#btn-queue-detail").style.display = canQueue ? "" : "none";
   $("#lib-detail").classList.add("show");
 }
 
@@ -4749,6 +4815,35 @@ async function playItem(id) {
   }
 }
 
+async function addToQueue(ids) {
+  ids = (ids || []).filter(Boolean);
+  if (!ids.length) return;
+  try {
+    const j = await postJson("/api/queue/add", {item_ids: ids});
+    if (!j.ok) { toast(j.error || "Add to queue failed"); return; }
+    if (!j.added) { toast("No matching tracks"); return; }
+    let msg = `Queued ${j.added} ` + (j.added === 1 ? "track" : "tracks");
+    if (j.missing) msg += ` · ${j.missing} missing`;
+    msg += ` · ${j.total} in queue`;
+    toast(msg);
+    setTimeout(poll, 250);
+  } catch (e) {
+    toast("Add to queue failed");
+  }
+}
+
+async function playQueue(startIndex) {
+  try {
+    const j = await postJson("/api/queue/play",
+                             {start_index: startIndex || 0});
+    toast(j.ok ? `Playing queue (${j.count} tracks)`
+               : (j.error || "Playback failed"));
+    setTimeout(poll, 500);
+  } catch (e) {
+    toast("Playback failed");
+  }
+}
+
 async function playPlaylist(plId, startIndex) {
   try {
     const j = await postJson(
@@ -4841,8 +4936,25 @@ $("#lib-genres").onclick = (ev) => {
 
 $("#upnext").onclick = (ev) => {
   const el = ev.target.closest(".upnext-row[data-id]");
-  if (el) playItem(el.dataset.id);
+  if (!el) return;
+  const q = state && state.queue;
+  if (q && q.source === "queued") {
+    playQueue(Number(el.dataset.index) || 0);
+  } else {
+    playItem(el.dataset.id);
+  }
 };
+
+// Queue buttons in track tables must not trigger the row's play handler.
+document.addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-queue]");
+  if (!btn) return;
+  const row = btn.closest(".track[data-id]");
+  if (!row) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  addToQueue([row.dataset.id]);
+}, true);
 
 $("#lib-recent").onclick = (ev) => {
   const add = ev.target.closest(".add-btn");
@@ -5061,6 +5173,24 @@ $("#btn-play-detail").onclick = async () => {
 };
 
 $("#btn-detail-close").onclick = hideDetail;
+
+$("#btn-queue-detail").onclick = () => {
+  if (!currentDetail) return;
+  const ids = (currentDetail.items || []).map(t => t.id).filter(Boolean);
+  addToQueue(ids);
+};
+
+$("#btn-play-queue").onclick = () => playQueue(0);
+
+$("#btn-clear-queue").onclick = async () => {
+  try {
+    const j = await postJson("/api/queue/clear", {});
+    toast(j.ok ? "Queue cleared" : (j.error || "Clear failed"));
+    setTimeout(poll, 250);
+  } catch (e) {
+    toast("Clear failed");
+  }
+};
 
 $("#btn-resync").onclick = async () => {
   if (!confirm("Clear the local media mirror and resync from iPod?")) return;
@@ -5485,6 +5615,41 @@ class Handler(BaseHTTPRequestHandler):
                     SETTINGS["auto_switch_iap2"] = payload["auto_switch_iap2"]
                 save_settings()
                 self._json({"ok": True, "settings": settings_snapshot()})
+            elif path == "/api/queue/add":
+                album_pid = payload.get("album_pid")
+                item_ids = payload.get("item_ids")
+                if album_pid:
+                    ids = item_ids_for_album(str(album_pid))
+                elif isinstance(item_ids, list) and item_ids:
+                    ids = [str(x) for x in item_ids]
+                else:
+                    self._json({"ok": False,
+                                "error": "missing album_pid or item_ids"}, 400)
+                    return
+                if not ids:
+                    self._json({"ok": False,
+                                "error": "no matching tracks"}, 400)
+                    return
+                added, missing, total = queue_add(ids)
+                self._json({"ok": True, "added": added,
+                            "missing": missing, "total": total})
+            elif path == "/api/queue/play":
+                ids = queue_builder_ids()
+                if not ids:
+                    self._json({"ok": False, "error": "Queue is empty"}, 400)
+                    return
+                try:
+                    start = int(payload.get("start_index") or 0)
+                except (TypeError, ValueError):
+                    start = 0
+                start = max(0, min(start, len(ids) - 1))
+                SESSION.play_item_list(ids, start, source="queue")
+                queue_clear()
+                self._json({"ok": True, "count": len(ids),
+                            "start_index": start})
+            elif path == "/api/queue/clear":
+                queue_clear()
+                self._json({"ok": True})
             elif path == "/api/play":
                 item_id = payload.get("item_id")
                 album_pid = payload.get("album_pid")

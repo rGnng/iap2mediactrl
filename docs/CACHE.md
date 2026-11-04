@@ -208,11 +208,16 @@ if total > 64 and total % 64 <= 2:
 - `QUEUE["items"]`：队列条目，可能是：
   - **设备真实队列**：`0x5001` 的 PlaybackAttributes 14/15/17 触发 FT **0x0003**
     （扁平 u64 PID 数组）或 **0x0006**（MediaItemList）；`source="device"`。
-  - **网页发起的本地队列**：单曲/专辑/艺术家/流派/专辑艺术家/本地列表；`source="local"`。
+  - **网页发起的本地队列**：单曲/专辑/艺术家/流派/专辑艺术家/本地列表；
+    `source` 为 `single` / `album` / `artist` / `genre` / `album-artist` /
+    `device-playlist` / `queue` 等。
   - 只在内存；重启后由设备重新推送。
+- `QUEUE_BUILDER["items"]`：网页“加入 queue”构建的待播列表，只在内存。非空时
+  `queue_snapshot()` 以 `source="queued"` 返回它，Up Next 显示 `Queued` 和
+  Play/Clear；`Play queue` 用 `0x4C07` 一次性发送并清空。
 - `QUEUE["base"]`：队列窗口起始索引；`QUEUE["meta"]`：不在媒体库里的队列条目的元数据。
 - `queue_snapshot()` 用 Now Playing 的 `queue_index - base` 定位当前项，返回当前 +
-  接下来最多 20 首，并带 `source/base_index/total`。
+  接下来最多 20 首；待播队列返回最多 50 首，并带 `source/base_index/total`。
 
 设备队列请求参数（R29 page 943-946）：
 

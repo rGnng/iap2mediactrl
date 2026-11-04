@@ -346,7 +346,10 @@ The browser interface provides:
   sequence. `localPlaylist` supports adding/removing tracks; it is stored as
   a CSV debug file and cannot be created, renamed, or deleted.
 - An Up Next view that uses the device queue when available and a local queue
-  for playback initiated from the browser.
+  for playback initiated from the browser. Albums and individual tracks can be
+  appended to an editable queue; `Play queue` sends the ordered list to the
+  device. iAP2 has no insert-into-current-queue command, so the queued list is
+  assembled locally and sent as a new ordered list when played.
 - Library status, revision, session state, and a resynchronization action.
 - A two-column `MediaLibrary` panel: AFC on the left, iAP2 on the right.
   AFC side: `Pair / Trust`, manual cache load/update, `Quick Sync`,
@@ -405,7 +408,10 @@ endpoints are:
 | `GET` | `/api/library/songs?q=&limit=&offset=&sort=` | Song list with search, pagination, and sorting. |
 | `GET` | `/api/library/recent?q=&limit=&offset=` | Recently added tracks, using database dates when available. |
 | `GET` | `/api/library/artwork?pid=...` or `?album_pid=...` | Imported library artwork, original or thumbnail. |
-| `GET` | `/api/queue` | Current Up Next snapshot. |
+| `GET` | `/api/queue` | Current Up Next snapshot, including a non-empty queued list. |
+| `POST` | `/api/queue/add` | Append `item_ids` or all tracks of `album_pid` to the Up Next queue. |
+| `POST` | `/api/queue/play` | Send the queued list to the device and start playback. |
+| `POST` | `/api/queue/clear` | Clear the editable Up Next queue. |
 | `POST` | `/api/command` | HID control command. |
 | `POST` | `/api/play` | Play an item, album, artist, genre, album artist, device playlist, or item list. |
 | `POST` | `/api/library/sync` | Clear the iAP2 revision and reconnect for a full synchronization. |
