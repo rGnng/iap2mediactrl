@@ -1,0 +1,477 @@
+# iap2mediactrl
+
+`iap2mediactrl` is a proof-of-concept (PoC) implementation of an iAP2
+accessory that runs on Linux and controls media playback on an iPod touch over
+USB HID. It also mirrors the device media library and exposes a browser-based
+control interface.
+
+The project is a protocol reference for a future port to an embedded platform
+with USB host support, such as the ESP32-P4. It is not production firmware, it
+is not MFi certified, and it is not intended to be deployed as-is.
+
+## Implementation status
+
+The reference device is an iPod touch (7th generation, model A2178) running
+iOS 15.7.8 and enumerating as USB `05ac:12aa`. The reference host is Linux on
+aarch64 with Python 3.14. The development media library contained 20,564
+tracks, 2,095 albums, and 5,045 artists.
+
+| Capability | Status | Implementation |
+|---|---|---|
+| USB HID transport | Verified | `hid_async.py` selects USB configuration 2, uses HID interface 2 and interrupt endpoint `0x83`, reassembles input reports, and sends output reports with `SET_REPORT`. |
+| MFi 3.0 authentication | Verified | `mfi_local.py` loads a P-7B certificate and a PKCS#8 P-256 private key, signs the 32-byte challenge, and returns a 64-byte raw ECDSA signature. |
+| iAP2 link layer | Verified, experimental | `ref_iap2_link_layer.py` implements `FF 5A` framing, header and payload checksums, SYN/ACK negotiation, session multiplexing, and file-transfer session 12. |
+| Identification | Verified | `auth_test.py` declares the iAP2 HID component (`0x0012`) together with the required sent and received message lists. |
+| Now Playing | Verified | `0x5000` subscription and `0x5001` parsing in `web_app.py`; metadata, playback state, elapsed time, queue position, shuffle and repeat mode, application name, and artwork transfer ID. |
+| Media library mirror | Verified | `0x4C03` subscription and `0x4C04` updates, including reset, deletion, and revision handling; the mirror is persisted to `media-library.json`. |
+| HID media controls | Verified | Play, pause, next, previous, stop, shuffle, repeat, volume step, and mute through `0x6802`. |
+| Playback selection | Verified | `0x4C06` resumes the current selection; `0x4C07` plays an ordered item list; `0x4C08` plays an album, artist, or device playlist. |
+| Artwork transfer | Verified | iAP2 file-transfer type `0x0002`; 200x200 and 600x600 JPEG images; latest image kept in memory and a 128-entry LRU disk cache. |
+| Device queue | Verified | Queue request through `0x5000`; file-transfer types `0x0003` and `0x0006`; the browser Up Next view prefers the device queue. |
+| Device playlists | Verified, read-only | Playlist groups from `0x4C04` and file-transfer type `0x0004`; the content is a big-endian array of 64-bit item persistent identifiers. |
+| Web interface and HTTP API | Implemented | `web_app.py` serves a single-page interface and a JSON API from a background iAP2 session. |
+| Date-added metadata | Verified, out-of-band | `media_db_import.py` reads `MediaLibrary.sqlitedb` over AFC/ifuse and writes `media-db-dates.json`. |
+| Library artwork | Verified, out-of-band | `media_db_artwork_import.py` copies artwork over AFC and writes `media-db-artwork.json` plus 160-pixel thumbnails. |
+| Embedded firmware | Not implemented | Architecture and feasibility notes are provided in `docs/PORTING_CPP.md` and the Tab5 documents. |
+
+## Architecture
+
+The control path and the media-database import path are deliberately separate.
+They use different USB configurations and cannot operate at the same time.
+
+### Control path
+
+```text
+iPod touch
+  |  USB configuration 2 / HID interface 2 / endpoint 0x83
+  v
+hid_async.py             HID report reassembly and asynchronous I/O
+  v
+ref_iap2_link_layer.py   iAP2 link layer, sessions, and file transfer
+  v
+csm.py / mfi_local.py    control-session messages and MFi authentication
+  v
+web_app.py               session state, library mirror, queue, HTTP API
+  v
+browser
+```
+
+`auth_test.py` contains the shared protocol helpers used by `web_app.py`,
+including identification parameters, the HID report descriptor, command
+encoding, and library parsing. It can also be executed as a standalone probe.
+
+### Out-of-band media database and artwork path
+
+```text
+iPod touch
+  |  USB configuration 3 or 4 (Apple Mobile Device)
+  v
+usbmuxd + libimobiledevice + ifuse (AFC)
+  |
+  +-- media_db_import.py         -> media-db-dates.json
+  |
+  +-- media_db_artwork_import.py -> media-artwork/
+  |                                  media-db-artwork.json
+  v
+web_app.py (read-only consumer)
+```
+
+`web_app.py` does not import or call libimobiledevice. The two paths exchange
+data through files, which keeps the iAP2 service independent of AFC
+availability and device pairing state.
+
+## Protocol implementation notes
+
+### HID report framing
+
+Each input report has the form:
+
+```text
+[report_id: u8] [LCB: u8] [payload: N bytes]
+```
+
+The device pads reports to the size class associated with the report ID and may
+omit one or two trailing padding bytes after a whole number of 64-byte USB
+packets. `hid_async.HIDReader` computes the expected report length from the
+report ID, reassembles the USB packets into complete reports, and removes the
+two-byte header before passing the payload to the iAP2 link layer.
+
+This step is required for correct file transfer. Treating the report headers as
+part of the iAP2 byte stream inserts two bytes at every report boundary and
+corrupts large artwork transfers.
+
+### iAP2 link layer
+
+The link layer uses the following frame format:
+
+```text
+FF 5A | u16 length | u8 control | u8 seq | u8 ack | u8 session
+      | u8 header checksum | payload | u8 payload checksum
+```
+
+The length field covers the complete frame. Each checksum is the two's
+complement of the byte sum, so the sum of the covered bytes modulo 256 is zero.
+Control messages use session 0, and file transfers use session 12.
+
+The implementation is experimental. It uses per-packet acknowledgements and
+tolerates a single sequence gap. It does not implement the complete iAP2
+window, retransmission, and flow-control state machine required for a
+production accessory.
+
+### MFi authentication
+
+The authentication exchange is:
+
+```text
+0xAA00 RequestAuthenticationCertificate
+0xAA01 certificate
+0xAA02 challenge
+0xAA03 signature
+0xAA05 AuthenticationSucceeded
+```
+
+The signature is ECDSA over the 32-byte SHA-256 challenge with the P-256
+private key. The implementation converts the DER-encoded signature to the
+64-byte `r || s` form expected by the device.
+
+### Media library synchronization
+
+The accessory subscribes with `0x4C03` and receives `0x4C04` updates. The
+device may first send a reset indication, followed by a deletion phase for the
+existing database, and then the full media-item set. The implementation
+recognizes the end of the deletion phase, re-subscribes with the current
+revision, and stores the resulting mirror in `media-library.json`.
+
+Subsequent connections send the stored revision and receive incremental
+updates. Item persistent identifiers are represented as 16 hexadecimal digits.
+
+The iAP2 media library protocol does not provide a Date Added field. `0x4C09`
+`PlayMediaLibrarySpecial` is the All Songs command, not a Recently Added
+collection, and is not used by the browser interface.
+
+## Date-added metadata and artwork recovery
+
+The device database is read out-of-band over AFC, not through iAP2. The
+database path below the AFC root is:
+
+```text
+iTunes_Control/iTunes/MediaLibrary.sqlitedb
+```
+
+On the device this corresponds to
+`/var/mobile/Media/iTunes_Control/iTunes/MediaLibrary.sqlitedb`.
+
+`media_db_import.py` uses `idevice_id`, `idevicepair`, and `ifuse` from
+libimobiledevice, validates that the device is paired, mounts the AFC
+filesystem, and reads the database. The database is in WAL mode, so the tool
+takes a consistent snapshot with the SQLite backup API instead of copying only
+the main file.
+
+The relevant mapping is:
+
+```text
+item.item_pid    -> iAP2 MediaItem persistent identifier
+item.date_added  -> seconds since 2001-01-01 UTC
+```
+
+The importer adds `978307200` to convert the Apple/Core Data timestamp to a
+Unix timestamp. It writes `media-db-dates.json`, which maps each 16-hex item
+identifier to a Unix timestamp. The album view uses the latest `date_added`
+value among the tracks in each album.
+
+Artwork is stored separately from the database:
+
+```text
+iTunes_Control/iTunes/Artwork/Originals/<relative_path>
+```
+
+The mapping is:
+
+```text
+item.item_pid
+  -> best_artwork_token.entity_pid
+  -> best_artwork_token.available_artwork_token
+  -> artwork.artwork_token
+  -> artwork.relative_path
+```
+
+`media_db_artwork_import.py` copies the referenced original images to
+`media-artwork/`, creates 160-pixel thumbnails under `media-artwork/thumbs/`,
+and writes `media-db-artwork.json` with item and album mappings. The web
+interface reads the JSON and image files directly. It does not require AFC to be
+available after the import has completed.
+
+The two USB paths are mutually exclusive:
+
+- iAP2 control uses USB configuration 2 with the HID interface.
+- AFC import uses USB configuration 3 or 4 with the Apple Mobile Device
+  interface.
+
+The web service must be stopped, and the device must be switched to the AFC
+configuration, before running an importer. The importers are read-only with
+respect to the device.
+
+## Repository layout
+
+| Path | Purpose |
+|---|---|
+| `auth_test.py` | Standalone authentication, identification, Now Playing, HID, artwork, and media-library probe; also provides shared helpers for `web_app.py`. |
+| `web_app.py` | Long-lived iAP2 session, media-library mirror, queue and history state, HTTP API, and single-page browser interface. |
+| `hid_async.py` | Asynchronous HID reader and writer with report reassembly. |
+| `ref_iap2_link_layer.py` | iAP2 link layer, session multiplexing, and file-transfer transport. |
+| `csm.py` | Control-session message encoding and parsing. |
+| `mfi_local.py` | Local MFi 3.0 P-256 authentication provider. |
+| `media_db_import.py` | AFC/ifuse importer for `MediaLibrary.sqlitedb` date-added values. |
+| `media_db_artwork_import.py` | AFC/ifuse importer for artwork files and item/album mappings. |
+| `run_web.sh` | Launcher for the web service with the permissions required for USB access. |
+| `requirements.txt` | Python dependencies. |
+| `docs/` | Handover notes, cache design, C++ porting notes, AFC importer notes, and Tab5 feasibility studies. |
+| `artifacts/` | Local development logs, captures, snapshots, and early probe scripts; excluded from Git. |
+
+## Requirements
+
+### Host
+
+- Linux with USB host support and permission to access the Apple device.
+- Python 3.10 or newer; the reference environment used Python 3.14.
+- Root privileges or suitable udev rules for the USB device.
+
+System packages for the iAP2 path:
+
+```bash
+sudo apt install libusb-1.0-0-dev libhidapi-hidraw0 libhidapi-dev usbutils
+```
+
+System packages for the AFC import path:
+
+```bash
+sudo apt install usbmuxd libimobiledevice-utils ifuse
+```
+
+### Python
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### MFi identity
+
+The implementation expects an MFi identity outside the repository:
+
+```text
+../iap2cert/certificate.p7b
+../iap2cert/identity.pk8
+```
+
+The certificate must contain a P-256 leaf certificate. The private key may be
+PKCS#8 DER, PEM, or a raw 32-byte scalar. The paths are set at the top of
+`auth_test.py`.
+
+The certificate and private key are not included in this repository. They are
+subject to MFi licensing and non-disclosure terms and must not be committed,
+published, or shared.
+
+## Operation
+
+### Standalone probe
+
+```bash
+sudo .venv/bin/python auth_test.py
+```
+
+The probe performs link negotiation, MFi authentication, identification, Now
+Playing subscription, media-library subscription, and HID setup. It exits after
+a fixed interval. Useful environment variables:
+
+| Variable | Purpose |
+|---|---|
+| `HID_COMMAND` | Send one HID command after identification, for example `play`, `pause`, `next`, or `previous`. |
+| `HID_DELAY` | Delay in seconds before sending `HID_COMMAND`. |
+| `HID_LOG_RAW` | Set to `1` to print raw HID reports. |
+| `IAP2_VERBOSE` | Set to `1` to print iAP2 packet-level logging. |
+| `RUN_SECONDS` | Duration of the standalone probe. |
+
+### Web service
+
+```bash
+sudo ./run_web.sh
+# or
+PORT=9000 sudo ./run_web.sh
+```
+
+Open `http://<host>:8080/` in a browser. The service runs the iAP2 session in a
+background thread and reconnects every two seconds after a link loss.
+
+The browser interface provides:
+
+- Now Playing metadata, playback state, elapsed time, queue position, shuffle
+  and repeat mode, application name, and artwork.
+- Play, pause, previous, next, stop, volume step, mute, shuffle, and repeat
+  controls.
+- Albums, artists, album artists, genres, songs, recently added tracks, and
+  device playlists.
+- Search, pagination, album sorting, album detail views, and playback of
+  individual tracks, albums, artists, genres, album artists, and device
+  playlists.
+- An Up Next view that uses the device queue when available and a local queue
+  for playback initiated from the browser.
+- Library status, revision, session state, and a resynchronization action.
+
+The web interface does not implement authentication. It binds to `0.0.0.0` and
+should only be exposed on a trusted network.
+
+### Media database and artwork import
+
+Stop the web service first, then switch the device to the AFC configuration.
+
+```bash
+sudo python3 media_db_import.py --mount
+sudo python3 media_db_artwork_import.py --mount
+```
+
+Expected outputs:
+
+```text
+media-db-dates.json
+media-db-artwork.json
+media-artwork/<sha1>.<ext>
+media-artwork/thumbs/<sha1>.jpg
+```
+
+See `docs/MEDIA_DB_IMPORT.md` for the complete procedure, pairing notes, and
+measured import results.
+
+## HTTP API
+
+The web service exposes a JSON API used by the single-page interface. The main
+endpoints are:
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/state` | Current Now Playing and session state. |
+| `GET` | `/api/artwork` | Latest Now Playing artwork. |
+| `GET` | `/api/library` | Library summary and album list. |
+| `GET` | `/api/library/album?pid=...` | Tracks in an album. |
+| `GET` | `/api/library/songs?q=&limit=&offset=&sort=` | Song list with search, pagination, and sorting. |
+| `GET` | `/api/library/recent?limit=&offset=` | Recently added tracks, using database dates when available. |
+| `GET` | `/api/library/artwork?pid=...` or `?album_pid=...` | Imported library artwork, original or thumbnail. |
+| `GET` | `/api/queue` | Current Up Next snapshot. |
+| `POST` | `/api/command` | HID control command. |
+| `POST` | `/api/play` | Play an item, album, artist, genre, album artist, device playlist, or item list. |
+| `POST` | `/api/library/sync` | Clear the local mirror and reconnect for a full synchronization. |
+
+Additional endpoints for artists, album artists, genres, playlists, history, and
+smart lists are implemented in `web_app.py`.
+
+## Persistent data and Git policy
+
+The repository excludes runtime state, device-derived metadata, credentials, and
+Apple reference material. The main excluded paths are:
+
+| Path | Reason |
+|---|---|
+| `media-library.json` | Device media-library mirror. |
+| `media-db-dates.json` | Per-track date-added values derived from the device database. |
+| `media-db-artwork.json` | Item and album artwork mappings. |
+| `media-artwork/` | Imported artwork and thumbnails. |
+| `artwork-cache/` | Now Playing artwork LRU cache. |
+| `playlists.json` | Accessory-side playlist state. |
+| `history.json` | Playback history. |
+| `artifacts/` | Development logs, captures, and SQLite snapshots. |
+| `docs/reference/` | Apple specification, not redistributable. |
+| `iap2cert/`, `*.p7b`, `*.pk8`, `*.pem`, `*.key` | MFi identity and private keys. |
+
+Library state is written atomically with a temporary file and `os.replace()`.
+The media-library mirror is saved when it is dirty and has been idle for more
+than five seconds; the service checks every ten seconds. Playback history keeps
+the most recent 500 track changes. Accessory-side playlists are limited to 2,000
+items because of the iAP2 message size limit.
+
+## Limitations
+
+- The link layer is experimental and does not provide a complete production
+  retransmission and flow-control implementation.
+- iAP2 does not provide absolute volume control or a seek command. Volume is
+  controlled through HID increment and decrement usages. Fast-forward and
+  rewind usages are present in the HID descriptor, but a short press is
+  interpreted by the device as next or previous; seeking has not been verified.
+- Date Added is not part of the iAP2 media library. It is recovered from the
+  device SQLite database over AFC. The value reflects the database content and
+  may represent a bulk import or synchronization time.
+- The iAP2 media-item data does not include per-item artwork identifiers on the
+  tested device. Now Playing artwork is transferred over iAP2, while library
+  artwork is imported over AFC.
+- Device playlists are read-only. Accessory-side playlists are implemented in
+  the backend and HTTP API, but the current browser interface exposes only
+  device playlists.
+- The web interface has no authentication and supports a single device and a
+  single iAP2 session.
+- The iAP2 control path and the AFC import path require different USB
+  configurations and cannot run concurrently.
+- The project requires an MFi certificate and private key. It is not an MFi
+  certified product.
+
+## Embedded porting
+
+The Python implementation is a reference for a rewrite, not a codebase that can
+be cross-compiled for a microcontroller. A port to a platform such as the
+ESP32-P4 requires:
+
+- An ESP-IDF USB host implementation that selects USB configuration 2, claims
+  HID interface 2, reads endpoint `0x83`, and sends output reports with
+  `SET_REPORT`.
+- The same HID report reassembly rules, including report ID size classes and
+  the possible omission of one or two trailing padding bytes.
+- A C or C++ implementation of the iAP2 link layer, CSM codec, and file-transfer
+  state machine.
+- mbedTLS ECDSA P-256 for MFi authentication in place of the Python
+  `cryptography` package.
+- Persistent storage for the media-library mirror, the SQLite database, and
+  artwork, or a streaming path to a host.
+- A display and input implementation, such as LVGL, or retention of the HTTP
+  interface for a browser on another device.
+
+The 50.7 MB `MediaLibrary.sqlitedb` does not fit in 16 MB of flash or 32 MB of
+PSRAM. A P4-class device must stream the database to SD storage or to a host;
+the firmware code size itself is not the limiting factor. The AFC service does
+not require TLS, but the lockdown session does, and a valid pairing record is
+required.
+
+Relevant design documents:
+
+- `docs/PORTING_CPP.md` — C++ module layout, threading model, and embedded
+  constraints.
+- `docs/tab5-port-assessment.md` — ESP32-P4 and M5Stack Tab5 feasibility
+  assessment.
+- `docs/tab5-afc-db-pull-feasibility.md` — AFC database extraction, memory
+  budget, and minimal protocol stack.
+
+## Documentation
+
+- `docs/HANDOVER.md` — protocol findings, implementation status, and operational
+  notes.
+- `docs/CACHE.md` — cache and persistence design.
+- `docs/PORTING_CPP.md` — C++ and embedded port draft.
+- `docs/MEDIA_DB_IMPORT.md` — AFC/ifuse database and artwork import.
+- `docs/ft-file-transfer.md` — iAP2 file-transfer concepts and command values.
+- `docs/tab5-port-assessment.md` — Tab5 port assessment.
+- `docs/tab5-afc-db-pull-feasibility.md` — AFC database pull feasibility.
+
+The Apple Accessory Interface Specification is not included in this repository.
+It is restricted reference material and must be obtained through the appropriate
+Apple program.
+
+## Attribution and licensing
+
+The iAP2 link-layer and HID transport implementations are derived from the
+`wiomoc/iap2` project and have been modified for this codebase. Review and
+preserve the upstream attribution and license terms before redistributing this
+repository.
+
+No license file is currently included. Add an explicit license before
+redistributing the project.
+
+This project is not affiliated with, endorsed by, or certified by Apple Inc.
+iPod, iPhone, iPad, MFi, and related marks are trademarks of Apple Inc.

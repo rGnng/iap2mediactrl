@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.python-version
+
+# MFi identity and other credentials
+iap2cert/
+*.p7b
+*.pk8
+*.pem
+*.key
+
+# Apple reference documentation; not redistributable
+docs/reference/
+
+# Runtime library data and caches
+media-library.json
+media-db-dates.json
+media-db-artwork.json
+media-artwork/
+artwork-cache/
+playlists.json
+history.json
+media-db-snapshot/
+*.sqlitedb
+*.db
+*.db-wal
+*.db-shm
+
+# Development artifacts (logs, captures, snapshots, probe output)
+artifacts/
+
+# Local configuration and operating-system files
+.env
+.env.*
+*.log
+.DS_Store
