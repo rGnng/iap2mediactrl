@@ -19,7 +19,7 @@ The reference device is an iPod touch (7th generation, model A2178) running
 iOS 15.7.8 and enumerating as USB `05ac:12aa`. The USB layer also accepts an
 iPhone (`05ac:12a8`); both expose the iAP2 HID interface in configuration 2.
 The reference host is Linux on aarch64 with Python 3.14. The development media
-library contained 20,564 tracks, 2,095 albums, and 5,045 artists.
+library contained about 20,500 tracks, 2,095 albums, and 5,045 artists.
 
 | Capability | Status | Implementation |
 |---|---|---|
@@ -354,7 +354,8 @@ The browser interface provides:
   `Clear iAP2 Library`, `Clear iAP2 Artwork`, `Switch to iAP2`.
   Cache loading is manual. `Auto switch to iAP2 after AFC tasks` is off by
   default and persisted in `settings.json`. Bootstrap Icons are vendored under
-  `static/bootstrap-icons/`; the page loads no external CDN assets.
+  `static/bootstrap-icons/`; the page loads no external CDN assets. Browser
+  tabs are icon-only, with the search field to their right.
 
 The web interface does not implement authentication. It binds to `0.0.0.0` and
 should only be exposed on a trusted network.

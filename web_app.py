@@ -1335,9 +1335,13 @@ def library_album(pid=None, artist=None, album=None):
             "id": it.get("id"),
             "title": it.get("title") or "",
             "artist": it.get("artist") or "",
+            "album": it.get("album") or "",
             "duration_ms": it.get("duration_ms") or 0,
             "track": it.get("track") or 0,
             "disc": it.get("disc") or 1,
+            "first_seen": it.get("first_seen") or 0.0,
+            "first_seen_seq": it.get("first_seen_seq") or 1,
+            "date_added": it.get("date_added"),
         })
     tracks.sort(key=lambda t: (t["disc"], t["track"],
                                (t["title"] or "").lower()))
@@ -1927,6 +1931,10 @@ class Session:
         while True:
             await asyncio.sleep(10)
             with LIBRARY_LOCK:
+                if (LIBRARY["syncing"]
+                        and time.time() - LIBRARY["last_update"] > 60):
+                    LIBRARY["syncing"] = False
+                    LIBRARY["batch_seq"] = None
                 dirty = LIBRARY["dirty"]
                 idle = time.time() - LIBRARY["last_change"]
                 version = LIBRARY["version"]
@@ -2416,8 +2424,8 @@ class Session:
         with LIBRARY_LOCK:
             revision = LIBRARY["revision"]
             LIBRARY["syncing"] = True
-            if not revision:
-                LIBRARY["batch_seq"] = None
+            LIBRARY["batch_seq"] = None
+            LIBRARY["batch_last"] = 0.0
             LIBRARY["last_update"] = time.time()
         params = [
             csm.string(0, uuid),
@@ -2456,7 +2464,8 @@ class Session:
         with LIBRARY_LOCK:
             changed = False
             now = time.time()
-            if (LIBRARY["batch_seq"] is not None
+            if (not LIBRARY["syncing"]
+                    and LIBRARY["batch_seq"] is not None
                     and now - LIBRARY["batch_last"] > 5.0):
                 LIBRARY["batch_seq"] = None
             old_revision = LIBRARY["revision"]

@@ -129,7 +129,7 @@ lockdown 的实际顺序是：
 - 如果只是把 DB 交给手机/PC，Tab5 可以完全不用 SD/SQLite，做成
   “USB-AFC → HTTP 下载”桥；50 MB 走 Wi-Fi，10–30 秒量级。
 - 如果 Tab5 要自己解析 `date_added`，才需要 SD + SQLite（或自己解析
-  SQLite 文件）。最终结果 `media-db-dates.json` 只有约 8 KB。
+  SQLite 文件）。最终日期表位于 `media-cache.db`，体积很小。
 
 ### 3.1 16 GB SD + 完整 libimobiledevice 的体积估算
 
@@ -190,7 +190,7 @@ storage,    data, littlefs, 0xA20000,  0x5E0000   # 6 MB
 | 其他/栈/堆 | 1–2 MB |
 | **合计** | **约 7–20 MB**，32 MB 够用 |
 
-注意：不要把 50 MB DB 或 11 MB `media-library.json` 整个读进 PSRAM。
+注意：不要把 50 MB 的 AFC DB 或完整的 `iap2.db` 媒体库镜像整个读进 PSRAM。
 DB 放 SD，媒体库用 SQLite/分页；否则 32 MB 会被吃得很紧。
 
 **16 GB SD 的容量预算**：

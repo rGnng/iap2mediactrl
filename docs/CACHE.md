@@ -10,7 +10,7 @@
 | Now Playing（标题/专辑/艺术家/进度/队列/随机/循环） | `STATE["now_playing"]` | 否 | 设备 `0x5001` 推送 |
 | 媒体库信息（MPB / IRTL 两个库的 UUID） | `STATE["libraries"]` | 否 | 设备 `0x4C01` 推送 |
 | 最新封面 JPEG（内存） | `STATE["artwork_bytes"]` | 否 | 设备 FT artwork 完成；磁盘副本见下一行 |
-| 媒体库镜像（20,564 首） | `data/<library_id>/iap2.db` | **是** | 全量同步 / `0x4C04` 增量 |
+| 媒体库镜像（约 20.5k 首） | `data/<library_id>/iap2.db` | **是** | 全量同步 / `0x4C04` 增量 |
 | 条目首次发现顺序 | `iap2.db` (`items.first_seen_seq`) | **是** | 新发现批次递增，与 RTC 无关 |
 | 真实添加时间 | `data/<library_id>/media-cache.db` (`dates`) | **是** | 独立 `media_db_import.py` 读取 `MediaLibrary.sqlitedb` |
 | 封面映射 | `data/<library_id>/media-cache.db` (`artwork_*`) | **是** | 独立 `media_db_artwork_import.py` 读取 Artwork Originals |
@@ -18,7 +18,7 @@
 | SQLite 快照 | `data/<library_id>/snapshot/` | **是** | 手动/独立导入工具生成；含隐私元数据 |
 | 专辑索引 | `LIBRARY["_summary"]` | 否 | 媒体库 `version` 变化 |
 | 艺术家索引（5,045 位） | `LIBRARY["_artists"]` | 否 | 媒体库 `version` 变化 |
-| 歌曲排序索引（20,564 首） | `LIBRARY["_songs"]` | 否 | 媒体库 `version` 变化 |
+| 歌曲排序索引（约 20.5k 首） | `LIBRARY["_songs"]` | 否 | 媒体库 `version` 变化 |
 | 本地播放列表 | `data/<library_id>/localPlaylist.csv` | **是** | 添加/删除歌曲 |
 | 播放历史日志 | `data/<library_id>/history.log` | **是** | 曲目变化追加 JSON 行 |
 | 封面磁盘缓存（最多 128 张） | `data/<library_id>/artwork-cache/<id>.jpg` | **是** | FT 完成 / LRU |
@@ -35,7 +35,7 @@
 - `media_db_import.py` 是独立进程，通过 afcclient/ifuse 读取
   `/var/mobile/Media/iTunes_Control/iTunes/MediaLibrary.sqlitedb`。
 - 输出 `data/<library_id>/media-cache.db` 的 `dates` 表：
-  `pid → unix_timestamp`，来源为 `item.date_added`（20,564 个 PID 全部匹配当前镜像）。
+  `pid → unix_timestamp`，来源为 `item.date_added`（约 20.5k 个 PID 匹配当前镜像）。
 - `web_app.py` 只读该 SQLite 缓存，不 import libimobiledevice/ifuse。
 - `library_recent()` 和 `library_songs(sort=recent)` 优先使用
   `first_seen_seq`，再用 `date_added`/`first_seen`；RTC 不参与发现顺序。
@@ -66,7 +66,7 @@
 
 这是设备媒体库的**完整镜像**，用于：
 
-- 重连时带 `LastKnownMediaLibraryRevision` 做增量同步，避免每次全量拉 20,564 条；
+- 重连时带 `LastKnownMediaLibraryRevision` 做增量同步，避免每次全量拉约 20.5k 条；
 - Web UI 的专辑/艺术家/歌曲/搜索视图；
 - 本地播放列表解析曲目元数据。
 
@@ -81,7 +81,8 @@ seen(pid, first_seen_seq)
 
 - 每条 item 以 **MediaItemPersistentIdentifier**（16 位十六进制字符串）为 key。
 - `first_seen_seq` 是**首次发现顺序**，按同步批次递增，不依赖 RTC：
-  旧数据迁移为 1，新发现批次为 2、3、……
+  旧数据迁移为 1，新发现批次为 2、3、……。一次完整同步内的条目共享同一序号；
+  同步空闲超时后才结束该批次。
 - `first_seen` 时间戳保留用于显示/调试，但 `library_recent` 先按
   `first_seen_seq` 降序，再按 `date_added`/`first_seen` 排序。
 - `playlists` 存设备下发的 `MediaPlaylist` 组；内容来自 FT type `0x0004`。
@@ -184,7 +185,7 @@ iAP2 的媒体库是只读的；本地只保留一个名为 `localPlaylist` 的�
 - 专辑按 `album_pid` 聚合：同一专辑的不同标题/缺失标题会合并，取出现次数最多的标题和艺术家。
 - 艺术家优先按 `artist_pid` 聚合；没有 PID 时按艺术家名聚合。
 - 歌曲索引缓存了 `_search = (title + artist + album).lower()`，搜索时线性过滤；
-  20,564 条在 Python 里约几十毫秒。
+  约 20.5k 条在 Python 里约几十毫秒。
 - 所有派生索引都以 `version` 为 key；版本不匹配时重建，匹配时直接返回。
 - 索引只在**媒体库条目变化**时失效；`revision` 单独变化不重建。
 

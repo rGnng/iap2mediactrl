@@ -1,5 +1,11 @@
 # MediaCtrl Handover
 
+> Historical handover notes from an earlier snapshot. Current per-device
+> storage (`data/<library_id>/iap2.db`), `localPlaylist.csv`, `history.log`,
+> the split AFC/iAP2 panel, and the current UI are documented in `README.md`,
+> `CACHE.md`, and `MEDIA_DB_IMPORT.md`. References below to
+> `media-library.json`, `playlists.json`, and `history.json` are historical.
+
 ## 1. 目标
 
 在 Linux 上实现一个软件 iAP2 配件，通过 USB HID 连接 iPod touch（iOS 15.7.8），实现：

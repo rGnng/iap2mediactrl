@@ -30,7 +30,7 @@ subprocesses. The browser talks to it through `/api/media/action`.
 - `date_added` is Apple/Core Data epoch: add `978307200` for Unix time.
 - Current snapshot:
   - 20,688 DB rows
-  - 20,564 unique PIDs matched to the iAP2 mirror in `iap2.db`
+  - 20,555 unique PIDs matched to the iAP2 mirror in `iap2.db`
   - date range: 2024-03-21 .. 2026-10-22
 - Local cache: `data/<library_id>/media-cache.db`
 - DB snapshot: `data/<library_id>/snapshot/media-db-backup.sqlitedb`
@@ -222,7 +222,7 @@ Both importers accept `--progress-json` and print stable machine-readable lines:
 ```text
 PROGRESS {"stage":"db_copy","done":512,"total":2048,"unit":"pages",...}
 PROGRESS {"stage":"db_parse","done":20688,"total":20688,"unit":"rows",
-          "stats":{"rows":20688,"matched_library_items":20564}}
+          "stats":{"rows":20688,"matched_library_items":20555}}
 PROGRESS {"stage":"artwork_scan","done":0,"total":2187,"unit":"files",...}
 PROGRESS {"stage":"artwork_copy","done":1234,"total":2187,"unit":"files",
           "bytes_done":891234567,"bytes_total":1340441950,
