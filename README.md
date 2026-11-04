@@ -16,9 +16,10 @@ is not MFi certified, and it is not intended to be deployed as-is.
 ## Implementation status
 
 The reference device is an iPod touch (7th generation, model A2178) running
-iOS 15.7.8 and enumerating as USB `05ac:12aa`. The reference host is Linux on
-aarch64 with Python 3.14. The development media library contained 20,564
-tracks, 2,095 albums, and 5,045 artists.
+iOS 15.7.8 and enumerating as USB `05ac:12aa`. The USB layer also accepts an
+iPhone (`05ac:12a8`); both expose the iAP2 HID interface in configuration 2.
+The reference host is Linux on aarch64 with Python 3.14. The development media
+library contained 20,564 tracks, 2,095 albums, and 5,045 artists.
 
 | Capability | Status | Implementation |
 |---|---|---|
@@ -27,15 +28,17 @@ tracks, 2,095 albums, and 5,045 artists.
 | iAP2 link layer | Verified, experimental | `ref_iap2_link_layer.py` implements `FF 5A` framing, header and payload checksums, SYN/ACK negotiation, session multiplexing, and file-transfer session 12. |
 | Identification | Verified | `auth_test.py` declares the iAP2 HID component (`0x0012`) together with the required sent and received message lists. |
 | Now Playing | Verified | `0x5000` subscription and `0x5001` parsing in `web_app.py`; metadata, playback state, elapsed time, queue position, shuffle and repeat mode, application name, and artwork transfer ID. |
-| Media library mirror | Verified | `0x4C03` subscription and `0x4C04` updates, including reset, deletion, and revision handling; the mirror is persisted to `media-library.json`. |
+| Media library mirror | Verified | `0x4C03` subscription and `0x4C04` updates, including reset, deletion, and revision handling; each device is persisted to `data/<library_id>/iap2.db`. |
+| First-seen order | Implemented | Monotonic `first_seen_seq` batches in `iap2.db`, independent of RTC time; existing rows migrate as batch 1. |
 | HID media controls | Verified | Play, pause, next, previous, stop, shuffle, repeat, volume step, and mute through `0x6802`. |
 | Playback selection | Verified | `0x4C06` resumes the current selection; `0x4C07` plays an ordered item list; `0x4C08` plays an album, artist, or device playlist. |
 | Artwork transfer | Verified | iAP2 file-transfer type `0x0002`; 200x200 and 600x600 JPEG images; latest image kept in memory and a 128-entry LRU disk cache. |
 | Device queue | Verified | Queue request through `0x5000`; file-transfer types `0x0003` and `0x0006`; the browser Up Next view prefers the device queue. |
 | Device playlists | Verified, read-only | Playlist groups from `0x4C04` and file-transfer type `0x0004`; the content is a big-endian array of 64-bit item persistent identifiers. |
 | Web interface and HTTP API | Implemented | `web_app.py` serves a single-page interface and a JSON API from a background iAP2 session. |
-| Date-added metadata | Verified, out-of-band | `media_db_import.py` reads `MediaLibrary.sqlitedb` over AFC/ifuse and writes `media-db-dates.json`. |
-| Library artwork | Verified, out-of-band | `media_db_artwork_import.py` copies artwork over AFC and writes `media-db-artwork.json` plus 160-pixel thumbnails. |
+| Date-added metadata | Verified, out-of-band | `media_db_import.py` reads `MediaLibrary.sqlitedb` over AFC and writes the `dates` table in `media-cache.db`. |
+| Library artwork | Verified, out-of-band | `media_db_artwork_import.py` copies artwork over AFC and writes image files, thumbnails, and the `artwork_*` tables in `media-cache.db`. |
+| MediaLibrary web sync | Implemented | Split AFC/iAP2 panel: pairing, manual AFC cache load/update, incremental `Quick Sync`, destructive `Full Refresh`, AFC cache clearing, iAP2 library/artwork clearing, incremental sync, numeric progress, cancellation, and optional automatic return to iAP2 (off by default). |
 | Embedded firmware | Not implemented | Architecture and feasibility notes are provided in `docs/PORTING_CPP.md` and the Tab5 documents. |
 
 ## Architecture
@@ -67,21 +70,18 @@ encoding, and library parsing. It can also be executed as a standalone probe.
 ### Out-of-band media database and artwork path
 
 ```text
-iOS device
-  |  USB configuration 3 or 4 (Apple Mobile Device)
-  v
-usbmuxd + libimobiledevice + ifuse (AFC)
-  |
-  +-- media_db_import.py         -> media-db-dates.json
-  |
-  +-- media_db_artwork_import.py -> media-artwork/
-  |                                  media-db-artwork.json
-  v
-web_app.py (read-only consumer)
+data/<library_id>/
+  iap2.db                  iAP2 mirror, playlists, first_seen_seq
+  media-cache.db           AFC dates and artwork mappings
+  media-artwork/           AFC artwork
+  artwork-cache/           iAP2 Now Playing artwork
+  snapshot/                MediaLibrary.sqlitedb snapshot
 ```
 
+`<library_id>` is the media-library GUID shared by AFC
+(`_MLDatabaseProperties._UUID`) and iAP2 (`0x4C01` library UUID prefix).
 `web_app.py` does not import or call libimobiledevice. The two paths exchange
-data through files, which keeps the iAP2 service independent of AFC
+data through SQLite/files, which keeps the iAP2 service independent of AFC
 availability and device pairing state.
 
 ## Protocol implementation notes
@@ -144,10 +144,14 @@ The accessory subscribes with `0x4C03` and receives `0x4C04` updates. The
 device may first send a reset indication, followed by a deletion phase for the
 existing database, and then the full media-item set. The implementation
 recognizes the end of the deletion phase, re-subscribes with the current
-revision, and stores the resulting mirror in `media-library.json`.
+revision, and stores the resulting mirror in
+`data/<library_id>/iap2.db`.
 
 Subsequent connections send the stored revision and receive incremental
 updates. Item persistent identifiers are represented as 16 hexadecimal digits.
+Items first discovered in one sync pass share a monotonic `first_seen_seq`;
+this order is independent of RTC time and is used by Recently Added. Existing
+items migrate as sequence 1; later discovery batches continue at 2, 3, ...
 
 The iAP2 media library protocol does not provide a Date Added field. `0x4C09`
 `PlayMediaLibrarySpecial` is the All Songs command, not a Recently Added
@@ -165,11 +169,12 @@ iTunes_Control/iTunes/MediaLibrary.sqlitedb
 On the device this corresponds to
 `/var/mobile/Media/iTunes_Control/iTunes/MediaLibrary.sqlitedb`.
 
-`media_db_import.py` uses `idevice_id`, `idevicepair`, and `ifuse` from
-libimobiledevice, validates that the device is paired, mounts the AFC
-filesystem, and reads the database. The database is in WAL mode, so the tool
-takes a consistent snapshot with the SQLite backup API instead of copying only
-the main file.
+`media_db_import.py` uses `idevice_id`, `idevicepair`, and `afcclient` from
+libimobiledevice, validates that the device is paired, and pulls the database
+over AFC. `ifuse` is used for the artwork tree and as a fallback for the
+database. The database is in WAL mode. `afcclient` avoids the FUSE page-cache
+issue that can make a large SQLite file copy inconsistent; the pulled files are
+checkpointed and validated locally before the snapshot is accepted.
 
 The relevant mapping is:
 
@@ -179,9 +184,10 @@ item.date_added  -> seconds since 2001-01-01 UTC
 ```
 
 The importer adds `978307200` to convert the Apple/Core Data timestamp to a
-Unix timestamp. It writes `media-db-dates.json`, which maps each 16-hex item
-identifier to a Unix timestamp. The album view uses the latest `date_added`
-value among the tracks in each album.
+Unix timestamp. It writes the `dates` table in
+`data/<library_id>/media-cache.db`, which maps each 16-hex item identifier to a
+Unix timestamp. The album view uses the latest `date_added` value among the
+tracks in each album.
 
 Artwork is stored separately from the database:
 
@@ -200,10 +206,11 @@ item.item_pid
 ```
 
 `media_db_artwork_import.py` copies the referenced original images to
-`media-artwork/`, creates 160-pixel thumbnails under `media-artwork/thumbs/`,
-and writes `media-db-artwork.json` with item and album mappings. The web
-interface reads the JSON and image files directly. It does not require AFC to be
-available after the import has completed.
+`data/<library_id>/media-artwork/`, creates 160-pixel thumbnails under
+`media-artwork/thumbs/`, and writes the `artwork_files`, `artwork_items`, and
+`artwork_albums` tables in `media-cache.db`. The web interface reads the
+SQLite cache and image files directly. It does not require AFC to be available
+after the import has completed.
 
 The two USB paths are mutually exclusive:
 
@@ -211,9 +218,18 @@ The two USB paths are mutually exclusive:
 - AFC import uses USB configuration 3 or 4 with the Apple Mobile Device
   interface.
 
-The web service must be stopped, and the device must be switched to the AFC
-configuration, before running an importer. The importers are read-only with
-respect to the device.
+`web_app.py` owns the transition through `media_jobs.py`:
+
+1. Stop the iAP2 session.
+2. Switch the device to configuration 3.
+3. Restart usbmuxd (the device may settle in configuration 4).
+4. Pull the database and artwork over AFC.
+5. If `Auto switch to iAP2` is enabled (default off), switch back to
+   configuration 2 and restart the iAP2 session.
+
+`Quick Sync` takes a new database snapshot and only copies new or changed
+artwork. `Full Refresh` deletes the local artwork cache and downloads every
+cover again. The importers are read-only with respect to the device.
 
 ## Repository layout
 
@@ -225,11 +241,16 @@ respect to the device.
 | `ref_iap2_link_layer.py` | iAP2 link layer, session multiplexing, and file-transfer transport. |
 | `csm.py` | Control-session message encoding and parsing. |
 | `mfi_local.py` | Local MFi 3.0 P-256 authentication provider. |
-| `media_db_import.py` | AFC/ifuse importer for `MediaLibrary.sqlitedb` date-added values. |
-| `media_db_artwork_import.py` | AFC/ifuse importer for artwork files and item/album mappings. |
+| `media_db_import.py` | AFC importer for `MediaLibrary.sqlitedb` date-added values. |
+| `media_db_artwork_import.py` | AFC importer for artwork files and item/album mappings. |
+| `media_cache.py` | SQLite schema, legacy JSON migration, and AFC cache queries. |
+| `device_store.py` | Per-device `iap2.db`, registry, localPlaylist CSV, and history log. |
+| `media_jobs.py` | USB mode transition, MediaLibrary task runner, progress and cancel. |
 | `run_web.sh` | Launcher for the web service with the permissions required for USB access. |
 | `requirements.txt` | Python dependencies. |
 | `docs/` | Handover notes, cache design, C++ porting notes, AFC importer notes, and Tab5 feasibility studies. |
+| `data/` | Per-device runtime data keyed by library GUID; excluded from Git. |
+| `static/bootstrap-icons/` | Vendored Bootstrap Icons CSS/fonts; served locally, no CDN. |
 | `artifacts/` | Local development logs, captures, snapshots, and early probe scripts; excluded from Git. |
 
 ## Requirements
@@ -306,7 +327,9 @@ PORT=9000 sudo ./run_web.sh
 ```
 
 Open `http://<host>:8080/` in a browser. The service runs the iAP2 session in a
-background thread and reconnects every two seconds after a link loss.
+background thread and reconnects every two seconds after a link loss. On Linux
+the phone may first enumerate in a PTP or USB-Ethernet configuration; the
+service switches it to configuration 2 before opening the HID interface.
 
 The browser interface provides:
 
@@ -314,35 +337,52 @@ The browser interface provides:
   and repeat mode, application name, and artwork.
 - Play, pause, previous, next, stop, volume step, mute, shuffle, and repeat
   controls.
-- Albums, artists, album artists, genres, songs, recently added tracks, and
-  device playlists.
+- Albums, artists, album artists, genres, songs, recently added tracks,
+  `localPlaylist`, and device playlists.
 - Search, pagination, album sorting, album detail views, and playback of
   individual tracks, albums, artists, genres, album artists, and device
-  playlists.
+  playlists. `localPlaylist` supports adding/removing tracks; it is stored as
+  a CSV debug file and cannot be created, renamed, or deleted.
 - An Up Next view that uses the device queue when available and a local queue
   for playback initiated from the browser.
 - Library status, revision, session state, and a resynchronization action.
+- A two-column `MediaLibrary` panel: AFC on the left, iAP2 on the right.
+  AFC side: `Pair / Trust`, manual cache load/update, `Quick Sync`,
+  `Full Refresh`, `Clear AFC Cache`. iAP2 side: `Sync iAP2`, `Full Resync`,
+  `Clear iAP2 Library`, `Clear iAP2 Artwork`, `Switch to iAP2`.
+  Cache loading is manual. `Auto switch to iAP2 after AFC tasks` is off by
+  default and persisted in `settings.json`. Bootstrap Icons are vendored under
+  `static/bootstrap-icons/`; the page loads no external CDN assets.
 
 The web interface does not implement authentication. It binds to `0.0.0.0` and
 should only be exposed on a trusted network.
 
 ### Media database and artwork import
 
-Stop the web service first, then switch the device to the AFC configuration.
+Use the `MediaLibrary` panel in the web interface for the normal workflow. The
+panel switches USB modes, pairs the device, runs the import, shows numeric
+progress, and loads the cache only when requested. `Auto switch to iAP2` is
+optional and off by default.
+
+The command-line tools remain available for diagnostics:
 
 ```bash
-sudo python3 media_db_import.py --mount
-sudo python3 media_db_artwork_import.py --mount
+sudo python3 media_db_import.py --mount --progress-json
+sudo python3 media_db_artwork_import.py --mount --mode quick --progress-json
+sudo python3 media_db_artwork_import.py --mount --mode full --progress-json
 ```
 
 Expected outputs:
 
 ```text
-media-db-dates.json
-media-db-artwork.json
-media-artwork/<sha1>.<ext>
-media-artwork/thumbs/<sha1>.jpg
+data/<library_id>/media-cache.db
+data/<library_id>/media-artwork/<sha1>.<ext>
+data/<library_id>/media-artwork/thumbs/<sha1>.jpg
+data/<library_id>/snapshot/media-db-backup.sqlitedb
 ```
+
+`--mode quick` reuses existing artwork and only copies missing/changed files.
+`--mode full` deletes the local artwork cache and downloads every cover again.
 
 See `docs/MEDIA_DB_IMPORT.md` for the complete procedure, pairing notes, and
 measured import results.
@@ -364,10 +404,21 @@ endpoints are:
 | `GET` | `/api/queue` | Current Up Next snapshot. |
 | `POST` | `/api/command` | HID control command. |
 | `POST` | `/api/play` | Play an item, album, artist, genre, album artist, device playlist, or item list. |
-| `POST` | `/api/library/sync` | Clear the local mirror and reconnect for a full synchronization. |
+| `POST` | `/api/library/sync` | Clear the iAP2 revision and reconnect for a full synchronization. |
+| `POST` | `/api/library/sync-incremental` | Request an incremental `0x4C03` library update with the current revision. |
+| `POST` | `/api/library/clear-iap2` | Clear the active device's iAP2 mirror; the protocol performs a full resync. |
+| `POST` | `/api/library/clear-artwork` | Clear the active device's iAP2 Now Playing artwork cache. |
+| `POST` | `/api/media/action` | Start an AFC action: `pair`, `quick`, `full`, `db`, `artwork`, or `clear`. |
+| `POST` | `/api/media/cancel` | Cancel the running MediaLibrary task. |
+| `POST` | `/api/media/mode` | Switch back to iAP2 mode (`{"mode":"iap2"}`). |
+| `POST` | `/api/media/load` | Load an on-disk cache into the web process: `{"target":"library"|"artwork"|"all"}`. |
+| `POST` | `/api/settings` | Persist UI settings, currently `{"auto_switch_iap2":bool}`. |
 
-Additional endpoints for artists, album artists, genres, playlists, history, and
-smart lists are implemented in `web_app.py`.
+The `/api/state` response includes a `media` object with the current device
+mode, active `library_id`, pairing state, UDID, AFC cache loaded counts, and
+the running/last task with numeric progress. Top-level `settings` contains the
+persisted UI options. Additional endpoints for artists, album artists, genres,
+and playlists are implemented in `web_app.py`.
 
 ## Persistent data and Git policy
 
@@ -376,22 +427,26 @@ Apple reference material. The main excluded paths are:
 
 | Path | Reason |
 |---|---|
-| `media-library.json` | Device media-library mirror. |
-| `media-db-dates.json` | Per-track date-added values derived from the device database. |
-| `media-db-artwork.json` | Item and album artwork mappings. |
-| `media-artwork/` | Imported artwork and thumbnails. |
-| `artwork-cache/` | Now Playing artwork LRU cache. |
-| `playlists.json` | Accessory-side playlist state. |
-| `history.json` | Playback history. |
+| `data/<library_id>/iap2.db` | Per-device iAP2 mirror, device playlists, and `first_seen_seq`. |
+| `data/<library_id>/media-cache.db` | Per-device AFC dates/artwork SQLite cache. |
+| `data/<library_id>/media-artwork/` | Imported AFC artwork and thumbnails. |
+| `data/<library_id>/artwork-cache/` | iAP2 Now Playing artwork LRU cache. |
+| `data/<library_id>/snapshot/` | MediaLibrary.sqlitedb snapshot. |
+| `data/<library_id>/localPlaylist.csv` | Single local playlist CSV for debug. |
+| `data/<library_id>/history.log` | Track-change debug log. |
+| `data/devices.json` | Device registry and active library ID. |
+| `settings.json` | UI settings such as automatic return to iAP2. |
 | `artifacts/` | Development logs, captures, and SQLite snapshots. |
 | `docs/reference/` | Apple specification, not redistributable. |
 | `iap2cert/`, `*.p7b`, `*.pk8`, `*.pem`, `*.key` | MFi identity and private keys. |
 
 Library state is written atomically with a temporary file and `os.replace()`.
 The media-library mirror is saved when it is dirty and has been idle for more
-than five seconds; the service checks every ten seconds. Playback history keeps
-the most recent 500 track changes. Accessory-side playlists are limited to 2,000
-items because of the iAP2 message size limit.
+than five seconds; the service checks every ten seconds. `localPlaylist.csv`
+keeps one local playlist only; playlist creation/deletion is disabled. Track
+changes are appended to `history.log`; no structured history is kept. The
+local playlist is limited to 2,000 items because of the iAP2 message size
+limit.
 
 ## Limitations
 
@@ -410,8 +465,11 @@ items because of the iAP2 message size limit.
 - Device playlists are read-only. Accessory-side playlists are implemented in
   the backend and HTTP API, but the current browser interface exposes only
   device playlists.
-- The web interface has no authentication and supports a single device and a
-  single iAP2 session.
+- The web interface has no authentication and supports a single active device
+  and a single iAP2 session. MediaLibrary actions run privileged AFC tools, so
+  keep the interface on a trusted network.
+- Device separation uses the media-library GUID shared by AFC and iAP2. Two
+  devices restored from the same media-library backup could share that GUID.
 - The iAP2 control path and the AFC import path require different USB
   configurations and cannot run concurrently.
 - The project requires an MFi certificate and private key. It is not an MFi
@@ -458,7 +516,7 @@ Relevant design documents:
   notes.
 - `docs/CACHE.md` — cache and persistence design.
 - `docs/PORTING_CPP.md` — C++ and embedded port draft.
-- `docs/MEDIA_DB_IMPORT.md` — AFC/ifuse database and artwork import.
+- `docs/MEDIA_DB_IMPORT.md` — AFC database/artwork import and SQLite cache.
 - `docs/ft-file-transfer.md` — iAP2 file-transfer concepts and command values.
 - `docs/tab5-port-assessment.md` — Tab5 implementation guide.
 - `docs/tab5-afc-db-pull-feasibility.md` — AFC database pull feasibility.

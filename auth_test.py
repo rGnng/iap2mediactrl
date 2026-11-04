@@ -3,7 +3,6 @@
 import asyncio
 import os
 import struct
-import sys
 import time
 
 import hid
@@ -16,7 +15,9 @@ from mfi_local import LocalMfiProvider
 import ref_iap2_link_layer as link_layer
 
 APPLE_VID = 0x05AC
-APPLE_PID = 0x12AA
+# 0x12AA is the iPod touch, 0x12A8 is the iPhone. Both expose the iAP2
+# HID interface (interface 2) in USB configuration 2.
+APPLE_PIDS = (0x12AA, 0x12A8)
 CONFIG = 2
 
 # Certificates live outside the project: ../iap2cert/
@@ -35,14 +36,46 @@ OUTPUT_REPORTS = {
 }
 
 
-def set_configuration():
-    dev = usb.core.find(idVendor=APPLE_VID, idProduct=APPLE_PID)
+def find_device():
+    for pid in APPLE_PIDS:
+        dev = usb.core.find(idVendor=APPLE_VID, idProduct=pid)
+        if dev is not None:
+            return dev
+    return None
+
+
+def _sysfs_device_path(dev):
+    """Return the Linux sysfs directory for a pyusb device."""
+    ports = getattr(dev, "port_numbers", None)
+    if not ports:
+        return None
+    name = f"{dev.bus}-{'.'.join(str(p) for p in ports)}"
+    path = os.path.join("/sys/bus/usb/devices", name)
+    return path if os.path.isdir(path) else None
+
+
+def set_configuration(config=CONFIG):
+    dev = find_device()
     if dev is None:
-        sys.exit("No Apple device")
+        wanted = ", ".join(
+            f"{APPLE_VID:04x}:{pid:04x}" for pid in APPLE_PIDS)
+        raise RuntimeError(f"No Apple iAP2 device found ({wanted})")
     try:
-        dev.set_configuration(CONFIG)
-    except Exception as exc:  # noqa: BLE001
-        print(f"set_configuration: {exc}")
+        active = dev.get_active_configuration().bConfigurationValue
+    except Exception:  # noqa: BLE001
+        active = None
+    if active != config:
+        try:
+            dev.set_configuration(config)
+        except usb.core.USBError:
+            # On Linux the kernel audio/HID/network drivers already claim
+            # the interfaces, so pyusb reports EBUSY. Writing the config
+            # through sysfs unbinds those drivers first.
+            path = _sysfs_device_path(dev)
+            if path is None:
+                raise
+            with open(os.path.join(path, "bConfigurationValue"), "w") as fh:
+                fh.write(str(config))
     time.sleep(1)
     try:
         usb.util.dispose_resources(dev)
@@ -51,13 +84,21 @@ def set_configuration():
 
 
 def open_hid():
-    dev = hid.device()
-    dev.open(APPLE_VID, APPLE_PID)
-    print(
-        f"Opened HID: {dev.get_manufacturer_string()} / "
-        f"{dev.get_product_string()}"
-    )
-    return dev
+    # Select the iAP2 HID interface explicitly: an iPhone may expose more
+    # than one HID collection while it is in another USB configuration.
+    for entry in hid.enumerate(APPLE_VID, 0):
+        if entry.get("product_id") not in APPLE_PIDS:
+            continue
+        if entry.get("interface_number") != 2:
+            continue
+        dev = hid.device()
+        dev.open_path(entry["path"])
+        print(
+            f"Opened HID: {dev.get_manufacturer_string()} / "
+            f"{dev.get_product_string()}"
+        )
+        return dev
+    raise RuntimeError("Apple iAP2 HID interface not found")
 
 
 LIB_STATE = {"count": 0, "followed": False}

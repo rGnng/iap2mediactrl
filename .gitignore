@@ -16,6 +16,7 @@ iap2cert/
 docs/reference/
 
 # Runtime library data and caches
+data/
 media-library.json
 media-db-dates.json
 media-db-artwork.json
@@ -23,6 +24,7 @@ media-artwork/
 artwork-cache/
 playlists.json
 history.json
+settings.json
 media-db-snapshot/
 *.sqlitedb
 *.db

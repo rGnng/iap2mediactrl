@@ -700,8 +700,8 @@ UI 需要的视图：
   校验 `FF D8` 开头、`FF D9` 结尾；写入 `artwork-cache/<artwork_id>.jpg`。
 - 封面缓存：限制数量（例如 128 张）或总大小，按 LRU 淘汰。
 - 媒体库封面：iAP2 不提供逐条 artwork ID。需要从 AFC 的
-  `Artwork/Originals` 导入，生成 160px 缩略图；映射存 `media-db-artwork.json`
-  或 SQLite 表。该步骤不在 iAP2 会话内运行。
+  `Artwork/Originals` 导入，生成 160px 缩略图；映射存 SQLite
+  （`media-cache.db` 的 `artwork_*` 表）。该步骤不在 iAP2 会话内运行。
 - LVGL 显示：用 `esp_jpeg` 解码到 PSRAM，再转 RGB565；不要在主循环里反复解码
   大图，缓存当前封面和少量缩略图。
 

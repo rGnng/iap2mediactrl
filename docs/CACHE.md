@@ -10,43 +10,59 @@
 | Now Playing（标题/专辑/艺术家/进度/队列/随机/循环） | `STATE["now_playing"]` | 否 | 设备 `0x5001` 推送 |
 | 媒体库信息（MPB / IRTL 两个库的 UUID） | `STATE["libraries"]` | 否 | 设备 `0x4C01` 推送 |
 | 最新封面 JPEG（内存） | `STATE["artwork_bytes"]` | 否 | 设备 FT artwork 完成；磁盘副本见下一行 |
-| 媒体库镜像（20,564 首） | `media-library.json` | **是** | 全量同步 / `0x4C04` 增量 |
-| 条目首次发现时间 | `media-library.json["first_seen"]` | **是** | 新条目首次写入时 |
-| 真实添加时间 | `media-db-dates.json` | **是** | 独立 `media_db_import.py` 读取 `MediaLibrary.sqlitedb` |
-| 封面映射 | `media-db-artwork.json` | **是** | 独立 `media_db_artwork_import.py` 读取 Artwork Originals |
-| 本地封面 | `media-artwork/` | **是** | 原图 + 160px 缩略图 |
-| SQLite 快照 | `artifacts/media-db-snapshot/` | **是** | 手动/独立导入工具生成；含隐私元数据 |
+| 媒体库镜像（20,564 首） | `data/<library_id>/iap2.db` | **是** | 全量同步 / `0x4C04` 增量 |
+| 条目首次发现顺序 | `iap2.db` (`items.first_seen_seq`) | **是** | 新发现批次递增，与 RTC 无关 |
+| 真实添加时间 | `data/<library_id>/media-cache.db` (`dates`) | **是** | 独立 `media_db_import.py` 读取 `MediaLibrary.sqlitedb` |
+| 封面映射 | `data/<library_id>/media-cache.db` (`artwork_*`) | **是** | 独立 `media_db_artwork_import.py` 读取 Artwork Originals |
+| 本地封面 | `data/<library_id>/media-artwork/` | **是** | 原图 + 160px 缩略图 |
+| SQLite 快照 | `data/<library_id>/snapshot/` | **是** | 手动/独立导入工具生成；含隐私元数据 |
 | 专辑索引 | `LIBRARY["_summary"]` | 否 | 媒体库 `version` 变化 |
 | 艺术家索引（5,045 位） | `LIBRARY["_artists"]` | 否 | 媒体库 `version` 变化 |
 | 歌曲排序索引（20,564 首） | `LIBRARY["_songs"]` | 否 | 媒体库 `version` 变化 |
-| 本地播放列表 | `playlists.json` | **是** | 创建/改名/增删/排序 |
-| 播放历史（最近 500 条） | `history.json` | **是** | 曲目变化 |
-| 封面磁盘缓存（最多 128 张） | `artwork-cache/<id>.jpg` | **是** | FT 完成 / LRU |
+| 本地播放列表 | `data/<library_id>/localPlaylist.csv` | **是** | 添加/删除歌曲 |
+| 播放历史日志 | `data/<library_id>/history.log` | **是** | 曲目变化追加 JSON 行 |
+| 封面磁盘缓存（最多 128 张） | `data/<library_id>/artwork-cache/<id>.jpg` | **是** | FT 完成 / LRU |
 | Up Next 队列 | `QUEUE`（内存） | 否 | 设备 FT 0x0003/0x0006 或网页发起播放 |
-| 播放历史内存副本 | `HISTORY`（内存） | 是（落盘） | `history_add` |
 | HID report size 映射 | `HIDReader._report_sizes` | 否（启动时计算） | 代码/固件变化时人工确认 |
 
 进程内缓存只在**一个进程**内使用：iAP2 会话线程负责写，HTTP 线程负责读。跨线程用
-`STATE_LOCK`、`LIBRARY_LOCK`、`PLAYLIST_LOCK` 三个互斥锁保护。`media-db-dates.json`
-和 `media-db-artwork.json` 由独立导入器生成，Web 服务以只读文件方式加载。
+`STATE_LOCK`、`LIBRARY_LOCK`、`PLAYLIST_LOCK` 三个互斥锁保护。所有持久化数据按
+`library_id`（AFC `_UUID` / iAP2 `0x4C01` UUID 前缀）分目录；旧的全局 JSON
+文件只用于首次迁移。
 
 ### 1.1 独立媒体库 DB 导入结果
 
-- `media_db_import.py` 是独立进程，通过 ifuse/AFC 读取
+- `media_db_import.py` 是独立进程，通过 afcclient/ifuse 读取
   `/var/mobile/Media/iTunes_Control/iTunes/MediaLibrary.sqlitedb`。
-- 输出 `media-db-dates.json`：`{pid: unix_timestamp}`，来源为
-  `item.date_added`（20,564 个 PID 全部匹配当前镜像）。
-- `web_app.py` 只读该结果文件，不 import libimobiledevice/ifuse。
-- `library_recent()` 和 `library_songs(sort=recent)` 优先使用 `date_added`；
-  `first_seen` 仅在新结果缺失时兜底。
-- 数据库是 WAL 模式，导入器用 SQLite backup 取一致快照；不能直接只复制主库。
+- 输出 `data/<library_id>/media-cache.db` 的 `dates` 表：
+  `pid → unix_timestamp`，来源为 `item.date_added`（20,564 个 PID 全部匹配当前镜像）。
+- `web_app.py` 只读该 SQLite 缓存，不 import libimobiledevice/ifuse。
+- `library_recent()` 和 `library_songs(sort=recent)` 优先使用
+  `first_seen_seq`，再用 `date_added`/`first_seen`；RTC 不参与发现顺序。
+- 数据库是 WAL 模式；afcclient 直接拉取主库和 WAL，本地 checkpoint/校验后再
+  生成快照。经 ifuse/FUSE 的大文件读取可能被页缓存撕裂。
 - 封面文件在 `iTunes/Artwork/Originals/`，不在数据库文件旁；映射为
   `best_artwork_token → artwork.relative_path`。原始封面 2,187 张（1.34GB），
   缩略图 2,179 张；首次导入约 113.6 秒。
+- `media_jobs.py` 负责停止 iAP2、切 configuration、重启 usbmuxd、运行导入。
+  默认停留在 MediaLibrary 模式；只有勾选自动切换（`settings.json` 的
+  `auto_switch_iap2`）时才恢复 configuration 2 并重启 iAP2。
+
+### 1.2 手动加载与清理
+
+- Web 启动时**不加载** `dates`/`artwork` 到内存；普通库请求也不会自动加载。
+- `Load MediaLibrary` / `Load Artwork` 只读当前设备的 `media-cache.db`。
+- `Update MediaLibrary` / `Update Artwork` 会从设备更新，并加载更新后的结果。
+- `Clear AFC Cache` 删除当前设备的 `media-cache.db`、`media-artwork/`、
+  `snapshot/`，并卸载内存中的日期/封面；`iap2.db` 和 `artwork-cache/` 保留。
+- `Clear iAP2 Library` 清空当前设备的 `iap2.db`；协议会自动做一次全量 resync，
+  不提供“清空后暂停/自动 resync”开关。
+- `Clear iAP2 Artwork` 清空 `artwork-cache/` 和 Now Playing 内存图。
+- `settings.json` 持久化 UI 选项，默认 `auto_switch_iap2=false`。
 
 ## 2. 持久化缓存
 
-### 2.1 `media-library.json`（核心缓存）
+### 2.1 `iap2.db`（核心缓存）
 
 这是设备媒体库的**完整镜像**，用于：
 
@@ -54,52 +70,26 @@
 - Web UI 的专辑/艺术家/歌曲/搜索视图；
 - 本地播放列表解析曲目元数据。
 
-结构：
+SQLite 表：
 
-```json
-{
-  "revision": "882396",
-  "items": {
-    "66fc83b3d998c5d9": {
-      "id": "66fc83b3d998c5d9",
-      "title": "2 Months",
-      "media_type": 0,
-      "rating": 0,
-      "duration_ms": 157173,
-      "album_pid": "ca498ea42f678970",
-      "album": "メイドインアビス｜オリジナル・サウンドトラック",
-      "track": 14,
-      "tracks": 25,
-      "disc": 1,
-      "discs": 2,
-      "artist_pid": "da40ca77a31adf77",
-      "artist": "Kevin Penkin",
-      "albumArtist": "メイドインアビス",
-      "genre": "J-Pop"
-    }
-  },
-  "playlists": {},
-  "first_seen": {
-    "66fc83b3d998c5d9": 0.0
-  }
-}
+```sql
+meta(key, value)                         -- library_id, revision, next_seen_seq
+items(pid, ..., first_seen, first_seen_seq, data_json)
+playlists(pid, name, parent_pid, data_json)
+seen(pid, first_seen_seq)
 ```
 
-- `first_seen` 是 MediaCtrl **首次发现**该条目时的 Unix 时间；旧库条目为 `0.0`。
-  iAP2 媒体库本身没有“添加日期”字段；当 `media-db-dates.json` 存在时，
-  `library_recent` 优先使用其中的真实 `date_added`，`first_seen` 仅作回退。
-  新条目在下一次增量同步时获得 `first_seen`；随后完成 AFC 导入时可获得数据库中的
-  真实 `date_added`。
-- 该映射独立于 `items`，重新全量同步时不会被清空。
-
-- 当前大小约 **10.7 MB**，20,564 条 + `first_seen` 映射。
-- `items` 以 **MediaItemPersistentIdentifier**（16 位十六进制字符串）为 key，重复更新直接覆盖。
-- `playlists` 是设备下发的 `MediaPlaylist` 组（设备端只读）。当前有 `PlaylistSync`，
-  含 42 个 MediaItem PID；内容来自 FT type `0x0004` 的扁平 u64 数组。
-- 写入采用 **临时文件 + `os.replace()`**，避免掉电/崩溃留下半个 JSON。
+- 每条 item 以 **MediaItemPersistentIdentifier**（16 位十六进制字符串）为 key。
+- `first_seen_seq` 是**首次发现顺序**，按同步批次递增，不依赖 RTC：
+  旧数据迁移为 1，新发现批次为 2、3、……
+- `first_seen` 时间戳保留用于显示/调试，但 `library_recent` 先按
+  `first_seen_seq` 降序，再按 `date_added`/`first_seen` 排序。
+- `playlists` 存设备下发的 `MediaPlaylist` 组；内容来自 FT type `0x0004`。
+- 每次保存使用一个事务，全量替换 items/playlists/seen；WAL 模式。
 - 周期性保存：每 10 秒检查一次，只有 `dirty=True` 且距离最后一次变更 >5 秒才写盘；
   会话结束时也会保存。
 - `revision` 变化（即使没有条目变化）也会置 `dirty`，保证下次重连从最新 revision 增量同步。
+- 设备切换时按 `library_id` 加载对应 `iap2.db`，旧设备的镜像不会串到新设备。
 
 同步流程与缓存状态：
 
@@ -111,7 +101,7 @@
   → 最后一条 param7=0x5A
   → 重新发 4C03（带最新 revision）
   → 4C04 param2：MediaItem 组，逐条写入 items
-  → 保存 media-library.json
+  → 保存 iap2.db
 
 之后重连：
   4C03(revision=<已存值>)
@@ -134,61 +124,34 @@
 - 设备发 `0x4C04 param3` 的 MediaPlaylist 组后，会主动发 FT Setup（file type 0x0004）。
 - 文件内容是**扁平的大端 u64 PID 数组**（例如 336 字节 = 42 首）。
 - `apply_playlist_ft()` 每 8 字节解析一个 PID，写入 `LIBRARY["playlists"][id]["items"]`，
-  随 `media-library.json` 持久化。
+  随 `iap2.db` 持久化。
 - 播放用 `0x4C08 CollectionType=0 (Playlist)`；设备端只读。
 
-### 2.2 `playlists.json`（本地播放列表）
+### 2.2 `localPlaylist.csv`（唯一本地播放列表）
 
-iAP2 的媒体库是只读的，不能创建设备端播放列表；因此播放列表由配件侧维护。
-结构：
+iAP2 的媒体库是只读的；本地只保留一个名为 `localPlaylist` 的配件侧播放列表。
 
-```json
-{
-  "playlists": {
-    "2f3008ef900f48678fdaaf8b8a78c87d": {
-      "id": "2f3008ef900f48678fdaaf8b8a78c87d",
-      "name": "我的最爱",
-      "items": ["10083eb15250fc1a", "66fc83b3d998c5d9"],
-      "created": 1793726271.6,
-      "updated": 1793726271.6
-    }
-  }
-}
-```
+- 位置：`data/<library_id>/localPlaylist.csv`
+- 用户只能添加/删除歌曲，不能创建、改名或删除播放列表。
+- CSV 记录完整轨道信息：PID、标题、专辑、艺术家、专辑艺术家、专辑/艺术家 PID、
+  流派、作曲、rating、media_type、时长、track/disc、first_seen/seq、date_added 等。
+- 每台设备最多 2,000 首。
+- 播放时取有序 PID 列表，发 `0x4C07 PlayMediaLibraryItems`。
 
-- 每个播放列表最多 **2,000 首**（受 iAP2 单条消息长度限制）。
-- 只存 MediaItem ID，不复制标题/专辑；读取/播放时到 `media-library.json` 的内存镜像解析。
-- 缺失的曲目在读取时跳过，并在 `playlist.missing` 中报告。
-- 写入同样是临时文件 + `os.replace()`；创建/改名/增删/排序后立即保存。
-- 播放时取过滤后的有序 ID 列表，发 `0x4C07 PlayMediaLibraryItems`：
+### 2.3 `history.log`（播放历史日志）
 
-```text
-param 0: blob = 8 字节大端 MediaItemPersistentIdentifier × N
-param 1: uint32 ItemsStartingIndex
-param 2: utf8 库 UUID
-```
-
-### 2.3 `history.json`（播放历史）
-
-```json
-{"entries": [
-  {"id": "66fc83b3d998c5d9", "title": "2 Months",
-   "artist": "Kevin Penkin", "album": "...", "ts": 1793728207.1}
-]}
-```
-
-- 最近 500 条曲目变化；同一曲目 30 秒内不重复记录。
-- 用于“最近播放”“最常播放”智能列表；`GET /api/history` / `GET /api/history/top`。
-- 启动时加载，变化时原子写盘。
+- 位置：`data/<library_id>/history.log`
+- 每次曲目变化追加一行 JSON，包含 PID、标题、专辑、艺术家、时间戳和播放状态。
+- 不再维护结构化 history JSON 或智能列表；日志仅用于调试。
 
 ### 2.4 `artwork-cache/`（封面磁盘缓存）
 
-- FT artwork 完成后写 `artwork-cache/<artwork_id>.jpg`（临时文件 + rename）。
+- FT artwork 完成后写 `data/<library_id>/artwork-cache/<artwork_id>.jpg`（临时文件 + rename）。
 - 最多保留 128 张，按 mtime 淘汰最旧。
 - Now Playing 带 `artwork_id` 且缓存命中时，先显示缓存图；FT 完成后覆盖。
 - iAP2 不提供媒体库条目的 artwork ID（property 20 实测未下发），因此无法通过 iAP2
-  按条目请求封面；专辑/曲目缩略图由独立 AFC 导入器生成（`media-db-artwork.json`、
-  `media-artwork/thumbs/`），Now Playing 封面仍通过 FT 缓存。
+  按条目请求封面；专辑/曲目缩略图由独立 AFC 导入器生成（`media-cache.db`
+  的 `artwork_*` 表、`media-artwork/thumbs/`），Now Playing 封面仍通过 FT 缓存。
 
 ## 3. 内存缓存
 
@@ -203,7 +166,7 @@ param 2: utf8 库 UUID
 
 `STATE["artwork_bytes"]` 保存最新封面 JPEG（当前 171 KB / 600×600）。HTTP `/api/artwork`
 直接读内存；ETag 用 `artwork_ready_id` 作为查询参数 `?vid=N`，避免浏览器把旧图当新图。
-内存中的最新封面不持久化，但 FT 完成时会同时写入 `artwork-cache/<artwork_id>.jpg`；
+内存中的最新封面不持久化，但 FT 完成时会同时写入 `data/<library_id>/artwork-cache/<artwork_id>.jpg`；
 收到同一 `artwork_id` 时可从磁盘缓存加载。若设备没有上报 `artwork_id`，无法选择缓存图。
 嵌入式建议见 §5。
 
@@ -258,7 +221,7 @@ if total > 64 and total % 64 <= 2:
 0x5000 param 2 PlaybackQueueListContentTransferInfoRequest:
   IDs 0,1,6,12,14,16,18
 ```
-- `HISTORY`：最近 500 条曲目变化，落盘到 `history.json`。`record_now_playing()` 在
+- `history.log`：每次曲目变化追加一行 JSON。`record_now_playing()` 在
   `0x5001` 到达时把标题/艺术家与队列条目匹配，匹配成功就记录；同一曲目 30 秒内不重复。
 - 智能列表：
   - `history_recent(limit)`：按最近出现去重；
@@ -271,16 +234,16 @@ if total > 64 and total % 64 <= 2:
   `LIBRARY_LOCK` 下复制条目列表或索引引用。
 - **重复更新**：设备可能重复发送同一 MediaItem；按 ID 覆盖即可，不影响正确性。
 - **删除不存在项**：规范要求忽略，不视为错误。
-- **全量同步中途失败**：内存镜像已清空，但 `media-library.json` 只有在 `dirty` 时才写；
-  若进程崩溃，旧镜像我仍然在磁盘上（除非已经保存过空镜像）。建议在“重新同步”前备份
-  `media-library.json`；当前部署把备份放在 `/tmp/media-library-backup.json`。
+- **全量同步中途失败**：内存镜像已清空，但 `iap2.db` 只有在 `dirty` 时才写；
+  若进程崩溃，旧镜像仍然在磁盘上（除非已经保存过空镜像）。建议在“重新同步”前用
+  SQLite Backup API 备份当前设备的 `iap2.db`。
 - **重新同步**：清空内存镜像、`revision=None`、断开 iAP2 连接；重连后按首次全量流程拉取。
 
 ## 5. 封面缓存（当前与建议）
 
 ### 已实现
 
-- 内存保存最新一张封面；FT 完成后同时原子写入 `artwork-cache/<artwork_id>.jpg`。
+- 内存保存最新一张封面；FT 完成后同时原子写入 `data/<library_id>/artwork-cache/<artwork_id>.jpg`。
 - 最多 128 张，按 mtime 淘汰最旧；启动后命中 `artwork_id` 时先显示缓存图。
 - 设备每次 Now Playing 变化会主动发 FT Setup；配件回 Start，收完后回 Success 并覆盖缓存。
 - `/api/artwork` 带 `Cache-Control: no-store`，前端用 `?vid=<artwork_id>` 区分版本。
@@ -310,11 +273,11 @@ if total > 64 and total % 64 <= 2:
 
 | 故障 | 行为 | 恢复 |
 |---|---|---|
-| `media-library.json` 不存在 | 启动为空镜像 | 首次连接全量同步 |
+| `iap2.db` 不存在 | 启动为空镜像 | 首次连接全量同步 |
 | JSON 损坏 | 打印错误，保留空镜像 | 删除文件或点“重新同步” |
 | 全量同步中断 | 内存可能不完整 | 重新同步；必要时用备份 |
 | 播放列表引用已删除曲目 | 读取时跳过并计数 | 删除该曲目或重新添加 |
-| `history.json` 损坏 | 打印错误，历史为空 | 删除文件，重新累积 |
+| `history.log` 损坏 | 打印/忽略错误 | 删除日志文件，重新累积 |
 | 封面缓存文件损坏 | 校验 JPEG SOI 失败则忽略 | 删除对应文件，等下一次 FT |
 | 重启后 Up Next 为空 | 队列只在内存 | 重新从网页发起播放；历史仍保留 |
 | 封面 FT 中断 | 不覆盖旧封面 | 等下一次 Now Playing/FT |

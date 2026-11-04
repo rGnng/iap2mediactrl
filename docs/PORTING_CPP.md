@@ -396,11 +396,12 @@ FF/RW 短按在真机上表现为 next/previous；需要长按语义时发送 pr
 - 限制：单条 CSM 消息最大 65535 字节；8 字节 PID + 4 字节 param 头 → 最多约 5,400 首。
   实际建议限制 2,000 首。
 - 播放前批量查询缺失 PID，跳过并在 UI 显示 `missing` 数量。
-- 播放历史：`history.json` / SQLite `history` 表，记录最近 500 次曲目变化；
-  生成“最近播放”“最常播放”智能列表。
-- `first_seen`：iAP2 媒体库没有添加日期；可选的独立导入器 `media_db_import.py`
-  可通过 AFC/ifuse 读取 `MediaLibrary.sqlitedb` 的 `item.date_added`，生成
-  `media-db-dates.json`；iAP2 程序只读该结果，不链接 libimobiledevice。
+- 播放历史：仅追加 `history.log` 调试日志，不维护结构化历史/智能列表。
+- `first_seen_seq`：iAP2 媒体库没有添加日期；使用单调批次序号记录首次发现顺序，
+  不依赖 RTC。可选的独立导入器 `media_db_import.py` 可通过 AFC 读取
+  `MediaLibrary.sqlitedb` 的 `item.date_added`，写入
+  `data/<library_id>/media-cache.db` 的 `dates` 表；iAP2 程序只读该结果，不链接
+  libimobiledevice。
 
 ## 10. HTTP / JSON / UI
 

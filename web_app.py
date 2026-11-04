@@ -11,15 +11,19 @@ state and forwards commands to the session.
 """
 import asyncio
 import json
+import mimetypes
 import os
+import shutil
 import threading
 import time
-import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import csm
+import device_store
 import hid_async
+import media_cache
+import media_jobs
 import ref_iap2_link_layer as link_layer
 from auth_test import (
     CERT_PATH,
@@ -43,8 +47,6 @@ LIBRARY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "media-library.json")
 PLAYLISTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "playlists.json")
-HISTORY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "history.json")
 ARTWORK_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "artwork-cache")
 MEDIA_DATES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -54,12 +56,18 @@ MEDIA_ARTWORK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 MEDIA_ARTWORK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "media-artwork")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MEDIA_CACHE_PATH = os.path.join(BASE_DIR, "media-cache.db")
+SETTINGS_PATH = os.path.join(BASE_DIR, "settings.json")
 
 STATE_LOCK = threading.Lock()
+CACHE_LOCK = threading.Lock()
+SETTINGS_LOCK = threading.Lock()
 FT_PLAYLIST_FILES = {}
 FT_QUEUE_FILES = {}
-MEDIA_DATES = {"mtime": 0.0, "dates": {}}
-MEDIA_ARTWORK = {"mtime": 0.0, "items": {}, "albums": {}}
+MEDIA_DATES = {"mtime": 0.0, "dates": {}, "loaded": False}
+MEDIA_ARTWORK = {"mtime": 0.0, "items": {}, "albums": {},
+                 "loaded": False, "files": 0}
+SETTINGS = {"auto_switch_iap2": False}
 STATE = {
     "connected": False,
     "link_state": None,
@@ -109,10 +117,16 @@ STATE = {
 # ---------------------------------------------------------------------------
 LIBRARY_LOCK = threading.Lock()
 LIBRARY = {
+    "library_id": None,
     "revision": None,
     "items": {},
     "playlists": {},
     "first_seen": {},
+    "first_seen_seq": {},
+    "next_seen_seq": 1,
+    "batch_seq": None,
+    "batch_last": 0.0,
+    "paused": False,
     "dirty": False,
     "syncing": False,
     "last_change": 0.0,
@@ -132,8 +146,50 @@ LIBRARY = {
 
 LIBRARY_RESYNC_REQUESTED = threading.Event()  # kept for external hooks
 
+
+def _library_id():
+    return LIBRARY.get("library_id")
+
+
+def _device_paths(library_id=None):
+    lid = library_id or _library_id()
+    if lid:
+        return device_store.paths(lid)
+    return {
+        "dir": BASE_DIR,
+        "iap2_db": None,
+        "media_cache": MEDIA_CACHE_PATH,
+        "artwork": MEDIA_ARTWORK_DIR,
+        "now_playing": ARTWORK_CACHE_DIR,
+        "snapshot": os.path.join(BASE_DIR, "artifacts", "media-db-snapshot"),
+        "snapshot_db": os.path.join(BASE_DIR, "artifacts",
+                                    "media-db-snapshot",
+                                    "media-db-backup.sqlitedb"),
+    }
+
+
+def _media_cache_path():
+    return str(_device_paths()["media_cache"])
+
+
+def _artwork_dir():
+    return str(_device_paths()["artwork"])
+
+
+def _now_playing_dir():
+    return str(_device_paths()["now_playing"])
+
+
+def _snapshot_dir():
+    return str(_device_paths()["snapshot"])
+
+
+def _snapshot_db():
+    return str(_device_paths()["snapshot_db"])
+
+
 # ---------------------------------------------------------------------------
-# Accessory-side playlists.  iAP2's media library is read-only, so these are
+# Accessory-side playlists.  i2P's media library is read-only, so these are
 # assembled by the accessory and played with 0x4C07 (PlayMediaLibraryItems).
 # ---------------------------------------------------------------------------
 PLAYLIST_LOCK = threading.Lock()
@@ -144,36 +200,135 @@ MAX_PLAYLIST_ITEMS = 2000
 QUEUE_LOCK = threading.Lock()
 QUEUE = {"items": [], "source": "", "updated": 0.0,
          "base": 0, "meta": {}}
-HISTORY = []
-HISTORY_MAX = 500
+LAST_HISTORY = {"id": None, "ts": 0.0}
+
+
+
+LOCAL_PLAYLIST_ID = "localPlaylist"
+
+
+def _row_for_item(item):
+    return {
+        "pid": item.get("id"),
+        "title": item.get("title") or "",
+        "album": item.get("album") or "",
+        "artist": item.get("artist") or "",
+        "album_artist": item.get("albumArtist") or "",
+        "album_pid": item.get("album_pid") or "",
+        "artist_pid": item.get("artist_pid") or "",
+        "album_artist_pid": item.get("album_artist_pid") or "",
+        "genre": item.get("genre") or "",
+        "composer": item.get("composer") or "",
+        "genre_pid": item.get("genre_pid") or "",
+        "composer_pid": item.get("composer_pid") or "",
+        "artwork_id": item.get("artwork_id") or "",
+        "rating": item.get("rating") or 0,
+        "media_type": item.get("media_type") or "",
+        "compilation": 1 if item.get("compilation") else 0,
+        "duration_ms": item.get("duration_ms") or 0,
+        "track": item.get("track") or 0,
+        "track_count": item.get("track_count",
+                                item.get("tracks")) or 0,
+        "disc": item.get("disc") or 1,
+        "disc_count": item.get("disc_count", item.get("discs")) or 1,
+        "first_seen": item.get("first_seen") or 0.0,
+        "first_seen_seq": item.get("first_seen_seq") or 1,
+        "date_added": item.get("date_added") or "",
+        "extra_25": item.get("extra_25") or "",
+        "added_at": time.time(),
+    }
+
+
+def _row_to_entry(row):
+    return {
+        "id": row.get("pid") or row.get("id"),
+        "title": row.get("title") or "",
+        "artist": row.get("artist") or "",
+        "album": row.get("album") or "",
+        "album_artist": row.get("album_artist") or "",
+        "album_pid": row.get("album_pid") or None,
+        "artist_pid": row.get("artist_pid") or None,
+        "genre": row.get("genre") or "",
+        "composer": row.get("composer") or "",
+        "rating": row.get("rating") or 0,
+        "media_type": row.get("media_type"),
+        "compilation": bool(row.get("compilation")),
+        "duration_ms": row.get("duration_ms") or 0,
+        "track": row.get("track") or 0,
+        "disc": row.get("disc") or 1,
+        "first_seen": row.get("first_seen") or 0.0,
+        "first_seen_seq": row.get("first_seen_seq") or 1,
+        "date_added": row.get("date_added") or None,
+    }
+
+
+def _local_playlist_locked():
+    return PLAYLISTS["playlists"].setdefault(
+        LOCAL_PLAYLIST_ID,
+        {"id": LOCAL_PLAYLIST_ID, "name": LOCAL_PLAYLIST_ID,
+         "rows": {}, "items": [], "updated": 0.0})
 
 
 def load_playlists():
-    try:
-        with open(PLAYLISTS_PATH, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except FileNotFoundError:
-        return
-    except Exception as exc:  # noqa: BLE001
-        print(f"playlists load failed: {exc}")
-        return
-    playlists = data.get("playlists", {})
-    if not isinstance(playlists, dict):
-        return
+    library_id = _library_id()
+    rows = {}
+    if library_id:
+        rows = device_store.load_local_playlist(library_id)
+    else:
+        try:
+            with open(PLAYLISTS_PATH, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            playlists = data.get("playlists", {})
+            source = playlists.get(LOCAL_PLAYLIST_ID)
+            if source is None and playlists:
+                source = next(iter(playlists.values()))
+            if source:
+                with LIBRARY_LOCK:
+                    by_id = dict(LIBRARY["items"])
+                for pid in source.get("items", []):
+                    item = by_id.get(pid)
+                    if item:
+                        rows[pid] = _row_for_item(item)
+        except FileNotFoundError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            print(f"local playlist load failed: {exc}")
     with PLAYLIST_LOCK:
-        PLAYLISTS["playlists"] = playlists
-    print(f"playlists loaded: {len(playlists)}")
+        PLAYLISTS["playlists"] = {
+            LOCAL_PLAYLIST_ID: {
+                "id": LOCAL_PLAYLIST_ID,
+                "name": LOCAL_PLAYLIST_ID,
+                "rows": rows,
+                "items": list(rows.keys()),
+                "updated": time.time(),
+            }
+        }
+    print(f"localPlaylist loaded: {len(rows)} tracks")
 
 
 def save_playlists():
     with PLAYLIST_LOCK:
-        tmp = PLAYLISTS_PATH + ".tmp"
-        try:
+        pl = _local_playlist_locked()
+        rows = dict(pl.get("rows", {}))
+        items = list(pl.get("items", []))
+        library_id = _library_id()
+    try:
+        if library_id:
+            device_store.save_local_playlist(library_id, rows)
+        else:
+            payload = {"playlists": {
+                LOCAL_PLAYLIST_ID: {
+                    "id": LOCAL_PLAYLIST_ID,
+                    "name": LOCAL_PLAYLIST_ID,
+                    "items": items,
+                }
+            }}
+            tmp = PLAYLISTS_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(PLAYLISTS, fh, ensure_ascii=False)
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
             os.replace(tmp, PLAYLISTS_PATH)
-        except Exception as exc:  # noqa: BLE001
-            print(f"playlists save failed: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"localPlaylist save failed: {exc}")
 
 
 def _playlist_meta(pl):
@@ -181,141 +336,104 @@ def _playlist_meta(pl):
         "id": pl["id"],
         "name": pl["name"],
         "tracks": len(pl.get("items", [])),
-        "created": pl.get("created", 0),
         "updated": pl.get("updated", 0),
     }
 
 
 def playlist_list():
     with PLAYLIST_LOCK:
-        rows = [_playlist_meta(p) for p in PLAYLISTS["playlists"].values()]
-    rows.sort(key=lambda p: ((p["name"] or "").lower(), p["id"]))
+        pl = _local_playlist_locked()
+        rows = [_playlist_meta(pl)]
     return {"playlists": rows, "total": len(rows)}
 
 
 def playlist_get(pl_id):
+    if pl_id != LOCAL_PLAYLIST_ID:
+        return {"ok": False, "error": "playlist not found"}
     with PLAYLIST_LOCK:
-        pl = PLAYLISTS["playlists"].get(pl_id)
-        if pl is None:
-            return {"ok": False, "error": "playlist not found"}
+        pl = _local_playlist_locked()
         meta = _playlist_meta(pl)
-        ids = list(pl.get("items", []))
-    wanted = set(ids)
-    with LIBRARY_LOCK:
-        by_id = {it.get("id"): it for it in LIBRARY["items"].values()
-                 if it.get("id") in wanted}
-    items = []
-    missing = 0
-    for item_id in ids:
-        it = by_id.get(item_id)
-        if it is None:
-            missing += 1
-            continue
-        items.append(song_entry(it))
-    meta["missing"] = missing
+        rows = [dict(row) for row in pl.get("rows", {}).values()]
+    items = [_row_to_entry(row) for row in rows]
+    meta["missing"] = 0
     return {"ok": True, "playlist": meta, "items": items}
 
 
 def playlist_create(name):
-    name = (name or "").strip()
-    if not name:
-        raise ValueError("Playlist name cannot be empty")
-    if len(name) > 120:
-        raise ValueError("Playlist name too long")
-    now = time.time()
-    pl = {"id": uuid.uuid4().hex, "name": name, "items": [],
-          "created": now, "updated": now}
-    with PLAYLIST_LOCK:
-        PLAYLISTS["playlists"][pl["id"]] = pl
-    save_playlists()
-    return _playlist_meta(pl)
+    raise ValueError("localPlaylist is the only local playlist")
 
 
 def playlist_rename(pl_id, name):
-    name = (name or "").strip()
-    if not name:
-        raise ValueError("Playlist name cannot be empty")
-    with PLAYLIST_LOCK:
-        pl = PLAYLISTS["playlists"].get(pl_id)
-        if pl is None:
-            raise KeyError("playlist not found")
-        pl["name"] = name[:120]
-        pl["updated"] = time.time()
-        meta = _playlist_meta(pl)
-    save_playlists()
-    return meta
+    raise ValueError("localPlaylist cannot be renamed")
 
 
 def playlist_delete(pl_id):
-    with PLAYLIST_LOCK:
-        pl = PLAYLISTS["playlists"].pop(pl_id, None)
-    if pl is None:
-        raise KeyError("playlist not found")
-    save_playlists()
-    return _playlist_meta(pl)
+    raise ValueError("localPlaylist cannot be deleted")
 
 
 def playlist_add_item(pl_id, item_id):
+    if pl_id != LOCAL_PLAYLIST_ID:
+        raise KeyError("playlist not found")
     with LIBRARY_LOCK:
         item = LIBRARY["items"].get(item_id)
     if item is None:
         raise KeyError("Track not found")
+    row = _row_for_item(item)
     with PLAYLIST_LOCK:
-        pl = PLAYLISTS["playlists"].get(pl_id)
-        if pl is None:
-            raise KeyError("playlist not found")
-        if item_id in pl["items"]:
+        pl = _local_playlist_locked()
+        if item_id in pl["rows"]:
             return {"ok": True, "already": True, "playlist": _playlist_meta(pl)}
-        if len(pl["items"]) >= MAX_PLAYLIST_ITEMS:
+        if len(pl["rows"]) >= MAX_PLAYLIST_ITEMS:
             raise ValueError(f"Playlist supports at most {MAX_PLAYLIST_ITEMS} tracks")
+        pl["rows"][item_id] = row
         pl["items"].append(item_id)
         pl["updated"] = time.time()
         meta = _playlist_meta(pl)
     save_playlists()
     return {"ok": True, "already": False, "playlist": meta,
-            "item": song_entry(item)}
+            "item": _row_to_entry(row)}
 
 
 def playlist_add_items(pl_id, item_ids):
-    """Add several items at once (album -> playlist)."""
+    if pl_id != LOCAL_PLAYLIST_ID:
+        raise KeyError("playlist not found")
     ids = [str(x) for x in (item_ids or []) if x]
-    with LIBRARY_LOCK:
-        valid = [x for x in ids if LIBRARY["items"].get(x)]
     if not ids:
         raise ValueError("No tracks to add")
-    missing = len(ids) - len(valid)
+    with LIBRARY_LOCK:
+        by_id = dict(LIBRARY["items"])
+    added = 0
+    already = 0
+    missing = 0
     with PLAYLIST_LOCK:
-        pl = PLAYLISTS["playlists"].get(pl_id)
-        if pl is None:
-            raise KeyError("playlist not found")
-        seen = set(pl["items"])
-        new_ids = []
-        already = 0
-        room = MAX_PLAYLIST_ITEMS - len(pl["items"])
-        for item_id in valid:
-            if item_id in seen:
+        pl = _local_playlist_locked()
+        for item_id in ids:
+            if item_id in pl["rows"]:
                 already += 1
                 continue
-            if len(new_ids) >= room:
+            item = by_id.get(item_id)
+            if item is None:
+                missing += 1
+                continue
+            if len(pl["rows"]) >= MAX_PLAYLIST_ITEMS:
                 raise ValueError(f"Playlist supports at most {MAX_PLAYLIST_ITEMS} tracks")
-            new_ids.append(item_id)
-            seen.add(item_id)
-        pl["items"].extend(new_ids)
+            pl["rows"][item_id] = _row_for_item(item)
+            pl["items"].append(item_id)
+            added += 1
         pl["updated"] = time.time()
         meta = _playlist_meta(pl)
     save_playlists()
-    return {"ok": True, "added": len(new_ids), "already": already,
+    return {"ok": True, "added": added, "already": already,
             "missing": missing, "playlist": meta}
 
 
 def playlist_remove_item(pl_id, item_id):
+    if pl_id != LOCAL_PLAYLIST_ID:
+        raise KeyError("playlist not found")
     with PLAYLIST_LOCK:
-        pl = PLAYLISTS["playlists"].get(pl_id)
-        if pl is None:
-            raise KeyError("playlist not found")
-        before = len(pl["items"])
+        pl = _local_playlist_locked()
+        removed = 1 if pl["rows"].pop(item_id, None) is not None else 0
         pl["items"] = [x for x in pl["items"] if x != item_id]
-        removed = before - len(pl["items"])
         pl["updated"] = time.time()
         meta = _playlist_meta(pl)
     save_playlists()
@@ -323,15 +441,17 @@ def playlist_remove_item(pl_id, item_id):
 
 
 def playlist_move(pl_id, from_index, to_index):
+    if pl_id != LOCAL_PLAYLIST_ID:
+        raise KeyError("playlist not found")
     with PLAYLIST_LOCK:
-        pl = PLAYLISTS["playlists"].get(pl_id)
-        if pl is None:
-            raise KeyError("playlist not found")
+        pl = _local_playlist_locked()
         items = pl["items"]
         if not (0 <= from_index < len(items) and 0 <= to_index < len(items)):
             raise ValueError("Index out of range")
         item = items.pop(from_index)
         items.insert(to_index, item)
+        rows = pl["rows"]
+        pl["rows"] = {pid: rows[pid] for pid in items}
         pl["updated"] = time.time()
         meta = _playlist_meta(pl)
     save_playlists()
@@ -339,10 +459,11 @@ def playlist_move(pl_id, from_index, to_index):
 
 
 def playlist_clear(pl_id):
+    if pl_id != LOCAL_PLAYLIST_ID:
+        raise KeyError("playlist not found")
     with PLAYLIST_LOCK:
-        pl = PLAYLISTS["playlists"].get(pl_id)
-        if pl is None:
-            raise KeyError("playlist not found")
+        pl = _local_playlist_locked()
+        pl["rows"] = {}
         pl["items"] = []
         pl["updated"] = time.time()
         meta = _playlist_meta(pl)
@@ -351,22 +472,7 @@ def playlist_clear(pl_id):
 
 
 def playlists_import(items):
-    created = 0
-    skipped = 0
-    for item in (items or []):
-        name = (item.get("name") or "").strip()
-        if not name:
-            skipped += 1
-            continue
-        try:
-            pl = playlist_create(name)
-            ids = [str(x) for x in item.get("items", []) if x]
-            if ids:
-                playlist_add_items(pl["id"], ids)
-            created += 1
-        except Exception:  # noqa: BLE001
-            skipped += 1
-    return {"ok": True, "created": created, "skipped": skipped}
+    raise ValueError("localPlaylist is the only local playlist")
 
 
 def playlist_play(pl_id, start_index=0):
@@ -377,36 +483,7 @@ def playlist_play(pl_id, start_index=0):
     if not ids:
         raise ValueError("Playlist is empty")
     SESSION.play_item_list(ids, start_index)
-    return {"ok": True, "played": len(ids),
-            "skipped": data["playlist"].get("missing", 0)}
-
-
-def load_history():
-    try:
-        with open(HISTORY_PATH, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except FileNotFoundError:
-        return
-    except Exception as exc:  # noqa: BLE001
-        print(f"history load failed: {exc}")
-        return
-    entries = data.get("entries", []) if isinstance(data, dict) else data
-    if isinstance(entries, list):
-        with QUEUE_LOCK:
-            HISTORY[:] = entries[-HISTORY_MAX:]
-    print(f"history loaded: {len(HISTORY)} entries")
-
-
-def save_history():
-    with QUEUE_LOCK:
-        payload = {"entries": list(HISTORY[-HISTORY_MAX:])}
-    tmp = HISTORY_PATH + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False)
-        os.replace(tmp, HISTORY_PATH)
-    except Exception as exc:  # noqa: BLE001
-        print(f"history save failed: {exc}")
+    return {"ok": True, "played": len(ids), "skipped": 0}
 
 
 def set_queue(item_ids, source="", base=0, meta=None):
@@ -555,75 +632,72 @@ def queue_snapshot(limit=20):
 
 
 def history_add(item_id, np=None):
+    """Append a single track-change record to the per-device history log."""
     if not item_id:
         return
     with LIBRARY_LOCK:
         it = LIBRARY["items"].get(item_id)
     if it is None:
         return
-    entry = {
-        "id": item_id,
-        "title": (it.get("title") or "").strip(),
-        "artist": (it.get("artist") or "").strip(),
-        "album": (it.get("album") or "").strip(),
-        "ts": time.time(),
-    }
+    now = time.time()
     with QUEUE_LOCK:
-        if HISTORY:
-            last = HISTORY[-1]
-            if last.get("id") == item_id and time.time() - last.get("ts", 0) < 30:
-                return
-        HISTORY.append(entry)
-        del HISTORY[:-HISTORY_MAX]
-    save_history()
+        if (LAST_HISTORY["id"] == item_id
+                and now - LAST_HISTORY["ts"] < 30):
+            return
+        LAST_HISTORY["id"] = item_id
+        LAST_HISTORY["ts"] = now
+    entry = _row_for_item(it)
+    entry["ts"] = now
+    if np:
+        entry["playback_status"] = np.get("status")
+        entry["elapsed_ms"] = np.get("elapsed_ms")
+        entry["queue_index"] = np.get("queue_index")
+        entry["queue_count"] = np.get("queue_count")
+    device_store.append_history_log(_library_id(), entry)
 
 
 def record_now_playing(np):
-    """Match a Now Playing update to our queue and record it in history."""
+    """Record each track change to history.log, with or without a queue."""
     title = (np.get("title") or "").strip()
     artist = (np.get("artist") or "").strip()
+    album = (np.get("album") or "").strip()
     if not title:
         return
     with QUEUE_LOCK:
         ids = list(QUEUE["items"])
-    if not ids:
-        return
-    for it in _resolve_items(ids):
-        if ((it.get("title") or "").strip() == title
-                and (it.get("artist") or "").strip() == artist):
-            history_add(it["id"], np)
+    if ids:
+        for it in _resolve_items(ids):
+            if ((it.get("title") or "").strip() == title
+                    and (it.get("artist") or "").strip() == artist):
+                history_add(it["id"], np)
+                return
+    now = time.time()
+    key = ("now-playing", title, artist, album)
+    with QUEUE_LOCK:
+        if (LAST_HISTORY["id"] == key
+                and now - LAST_HISTORY["ts"] < 30):
             return
+        LAST_HISTORY["id"] = key
+        LAST_HISTORY["ts"] = now
+    entry = {
+        "id": None,
+        "title": title,
+        "artist": artist,
+        "album": album,
+        "ts": now,
+        "playback_status": np.get("status"),
+        "elapsed_ms": np.get("elapsed_ms"),
+        "app": np.get("app"),
+    }
+    device_store.append_history_log(_library_id(), entry)
 
 
 def history_recent(limit=100):
-    with QUEUE_LOCK:
-        entries = list(reversed(HISTORY))
-    seen = set()
-    ids = []
-    for e in entries:
-        item_id = e.get("id")
-        if item_id and item_id not in seen:
-            seen.add(item_id)
-            ids.append(item_id)
-        if len(ids) >= limit:
-            break
-    return _resolve_items(ids)
+    return []
 
 
 def history_top(limit=100):
-    with QUEUE_LOCK:
-        entries = list(HISTORY)
-    counts = {}
-    for e in entries:
-        item_id = e.get("id")
-        if item_id:
-            counts[item_id] = counts.get(item_id, 0) + 1
-    ids = [item_id for item_id, _ in
-           sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))][:limit]
-    items = _resolve_items(ids)
-    for item in items:
-        item["play_count"] = counts.get(item["id"], 0)
-    return items
+    return []
 
 
 def item_ids_for_album(pid):
@@ -667,7 +741,7 @@ def item_ids_for_album_artist(name):
 
 
 def _artwork_cache_path(artwork_id):
-    return os.path.join(ARTWORK_CACHE_DIR, f"{artwork_id}.jpg")
+    return os.path.join(_now_playing_dir(), f"{artwork_id}.jpg")
 
 
 def load_cached_artwork(artwork_id):
@@ -693,15 +767,16 @@ def save_artwork_cache(artwork_id, blob):
     if artwork_id is None or not blob:
         return
     try:
-        os.makedirs(ARTWORK_CACHE_DIR, exist_ok=True)
+        cache_dir = _now_playing_dir()
+        os.makedirs(cache_dir, exist_ok=True)
         path = _artwork_cache_path(artwork_id)
         tmp = path + ".tmp"
         with open(tmp, "wb") as fh:
             fh.write(blob)
         os.replace(tmp, path)
         # Keep the cache bounded (oldest by mtime).
-        files = [os.path.join(ARTWORK_CACHE_DIR, name)
-                 for name in os.listdir(ARTWORK_CACHE_DIR)
+        files = [os.path.join(cache_dir, name)
+                 for name in os.listdir(cache_dir)
                  if name.endswith(".jpg")]
         if len(files) > 128:
             files.sort(key=lambda p: os.path.getmtime(p))
@@ -714,7 +789,54 @@ def save_artwork_cache(artwork_id, blob):
         print(f"artwork cache save failed: {exc}")
 
 
+def _adopt_library_data(data, library_id):
+    items = data.get("items", {})
+    playlists = data.get("playlists", {})
+    seen = dict(data.get("seen") or {})
+    next_seq = int(data.get("next_seen_seq") or 1)
+    first_seen = {}
+    max_seq = 0
+    for item_id, item in items.items():
+        item.setdefault("id", item_id)
+        seq = int(item.get("first_seen_seq") or seen.get(item_id) or 1)
+        item["first_seen_seq"] = seq
+        seen[item_id] = seq
+        ts = item.get("first_seen") or 0.0
+        item["first_seen"] = ts
+        first_seen[item_id] = ts
+        max_seq = max(max_seq, seq)
+    if next_seq <= max_seq:
+        next_seq = max_seq + 1
+    with LIBRARY_LOCK:
+        LIBRARY["library_id"] = library_id
+        LIBRARY["revision"] = data.get("revision")
+        LIBRARY["items"] = items
+        LIBRARY["playlists"] = playlists
+        LIBRARY["first_seen"] = first_seen
+        LIBRARY["first_seen_seq"] = seen
+        LIBRARY["next_seen_seq"] = next_seq
+        LIBRARY["batch_seq"] = None
+        LIBRARY["batch_last"] = 0.0
+        LIBRARY["paused"] = False
+        LIBRARY["dirty"] = False
+        LIBRARY["version"] += 1
+        LIBRARY["_summary"] = None
+        LIBRARY["_artists"] = None
+        LIBRARY["_songs"] = None
+        LIBRARY["_genres"] = None
+        LIBRARY["_album_artists"] = None
+
+
 def load_library():
+    lid = device_store.active_library_id()
+    if lid:
+        device_store.migrate_legacy(lid)
+        if device_store.iap2_exists(lid):
+            data = device_store.load_iap2(lid)
+            _adopt_library_data(data, lid)
+            print(f"media library loaded: {len(data['items'])} items, "
+                  f"revision {data.get('revision')}, library {lid}")
+            return
     try:
         with open(LIBRARY_PATH, "r", encoding="utf-8") as fh:
             data = json.load(fh)
@@ -723,47 +845,74 @@ def load_library():
     except Exception as exc:  # noqa: BLE001
         print(f"media library load failed: {exc}")
         return
-    with LIBRARY_LOCK:
-        LIBRARY["revision"] = data.get("revision")
-        items = data.get("items", {})
-        first_seen = data.get("first_seen", {})
-        # Legacy items have no known add time: keep 0.0 so a later
-        # "recently added" view doesn't pretend they are new.
-        for item_id, it in items.items():
-            ts = first_seen.get(item_id)
-            if ts is None:
-                ts = it.get("first_seen") or 0.0
-                first_seen[item_id] = ts
-            it["first_seen"] = ts
-        LIBRARY["items"] = items
-        LIBRARY["first_seen"] = first_seen
-        LIBRARY["playlists"] = data.get("playlists", {})
-        LIBRARY["version"] += 1
-    print(f"media library loaded: {len(data.get('items', {}))} items, "
-          f"revision {data.get('revision')}")
+    # Legacy global mirror; it is migrated to a per-device iap2.db as soon as
+    # the first iAP2 library UUID is known.
+    for item in data.get("items", {}).values():
+        item.setdefault("first_seen_seq", 1)
+    data.setdefault("next_seen_seq", 2)
+    _adopt_library_data(data, None)
+    print(f"media library loaded (legacy): {len(data.get('items', {}))} "
+          f"items, revision {data.get('revision')}")
 
 
-def load_media_dates():
-    """Load the separate MediaLibrary.sqlitedb importer result.
+def switch_library(library_id, name=None):
+    library_id = device_store.base_library_id(library_id)
+    if not library_id:
+        return
+    if LIBRARY.get("library_id") == library_id:
+        return
+    save_library()
+    device_store.migrate_legacy(library_id)
+    device_store.set_active(library_id, name=name)
+    data = device_store.load_iap2(library_id)
+    with STATE_LOCK:
+        MEDIA_DATES.update({"mtime": 0.0, "dates": {}, "loaded": False})
+        MEDIA_ARTWORK.update({"mtime": 0.0, "items": {}, "albums": {},
+                              "loaded": False, "files": 0})
+        STATE["artwork_bytes"] = b""
+        STATE["artwork_ready_id"] = None
+        STATE["artwork_mime"] = "image/jpeg"
+        STATE["library_revision"] = None
+        np = STATE["now_playing"]
+        for key in list(np.keys()):
+            np[key] = None
+        np.update({"title": "", "album": "", "artist": "",
+                   "album_artist": "", "genre": "", "composer": "",
+                   "duration_ms": 0, "elapsed_ms": 0, "app": "",
+                   "updated_at": 0.0})
+    _adopt_library_data(data, library_id)
+    with QUEUE_LOCK:
+        LAST_HISTORY["id"] = None
+        LAST_HISTORY["ts"] = 0.0
+    load_playlists()
+    print(f"active library: {library_id} ({name or 'unknown'}), "
+          f"{len(data['items'])} items", flush=True)
+
+
+def load_media_dates(force=False):
+    """Load dates from the MediaLibrary SQLite cache.
 
     The iAP2 service never talks to libimobiledevice/ifuse; it only reads the
-    normalized result file produced by media_db_import.py.
+    normalized cache written by media_db_import.py.
     """
     try:
-        stat = os.stat(MEDIA_DATES_PATH)
+        cache_path = _media_cache_path()
+        stat = os.stat(cache_path)
     except OSError:
+        with STATE_LOCK:
+            MEDIA_DATES["loaded"] = False
         return False
     with STATE_LOCK:
-        if stat.st_mtime <= MEDIA_DATES["mtime"]:
+        if not force and stat.st_mtime <= MEDIA_DATES["mtime"]:
             return False
     try:
-        with open(MEDIA_DATES_PATH, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        dates = data.get("dates", {})
-        if not isinstance(dates, dict):
-            return False
+        conn = media_cache.open_db(cache_path)
+        try:
+            dates = media_cache.load_dates(conn)
+        finally:
+            conn.close()
     except Exception as exc:  # noqa: BLE001
-        print(f"media date result load failed: {exc}")
+        print(f"media date cache load failed: {exc}")
         return False
     with LIBRARY_LOCK:
         count = 0
@@ -787,33 +936,41 @@ def load_media_dates():
     with STATE_LOCK:
         MEDIA_DATES["mtime"] = stat.st_mtime
         MEDIA_DATES["dates"] = dates
-    print(f"media date result loaded: {count} matched items")
+        MEDIA_DATES["loaded"] = True
+    print(f"media date cache loaded: {count} matched items")
     return True
 
 
-def load_media_artwork():
-    """Load the artwork importer result; no AFC code lives in this process."""
+def load_media_artwork(force=False):
+    """Load artwork mappings from the SQLite cache."""
     try:
-        stat = os.stat(MEDIA_ARTWORK_PATH)
+        cache_path = _media_cache_path()
+        stat = os.stat(cache_path)
     except OSError:
+        with STATE_LOCK:
+            MEDIA_ARTWORK["loaded"] = False
         return False
-    if stat.st_mtime <= MEDIA_ARTWORK["mtime"]:
-        return False
-    try:
-        with open(MEDIA_ARTWORK_PATH, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        items = data.get("items", {})
-        albums = data.get("albums", {})
-        if not isinstance(items, dict) or not isinstance(albums, dict):
+    with STATE_LOCK:
+        if not force and stat.st_mtime <= MEDIA_ARTWORK["mtime"]:
             return False
+    try:
+        conn = media_cache.open_db(cache_path)
+        try:
+            items, albums = media_cache.load_artwork(conn)
+            file_count = media_cache.artwork_file_count(conn)
+        finally:
+            conn.close()
     except Exception as exc:  # noqa: BLE001
-        print(f"media artwork result load failed: {exc}")
+        print(f"media artwork cache load failed: {exc}")
         return False
-    MEDIA_ARTWORK["mtime"] = stat.st_mtime
+    with STATE_LOCK:
+        MEDIA_ARTWORK["mtime"] = stat.st_mtime
+        MEDIA_ARTWORK["loaded"] = True
+        MEDIA_ARTWORK["files"] = file_count
     MEDIA_ARTWORK["items"] = items
     MEDIA_ARTWORK["albums"] = albums
-    print(f"media artwork result loaded: {len(items)} items, "
-          f"{len(albums)} albums")
+    print(f"media artwork cache loaded: {len(items)} items, "
+          f"{len(albums)} albums, {file_count} files")
     return True
 
 
@@ -822,24 +979,237 @@ def save_library():
         if not LIBRARY["dirty"]:
             return
         LIBRARY["dirty"] = False
+        library_id = LIBRARY["library_id"]
+        revision = LIBRARY["revision"]
+        items = LIBRARY["items"]
+        playlists = LIBRARY["playlists"]
+        next_seq = LIBRARY["next_seen_seq"]
+        first_seen = LIBRARY["first_seen"]
+        seen = LIBRARY["first_seen_seq"]
+        if library_id:
+            try:
+                device_store.save_iap2(
+                    library_id, items, playlists, revision=revision,
+                    next_seen_seq=next_seq, seen=seen)
+                print(f"media library saved: {len(items)} items -> "
+                      f"{device_store.paths(library_id)['iap2_db']}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"media library save failed: {exc}")
+                LIBRARY["dirty"] = True
+            return
         payload = {
-            "revision": LIBRARY["revision"],
-            "items": LIBRARY["items"],
-            "playlists": LIBRARY["playlists"],
-            "first_seen": LIBRARY["first_seen"],
+            "revision": revision,
+            "items": items,
+            "playlists": playlists,
+            "first_seen": first_seen,
+            "first_seen_seq": seen,
+            "next_seen_seq": next_seq,
         }
     tmp = LIBRARY_PATH + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False)
         os.replace(tmp, LIBRARY_PATH)
-        print(f"media library saved: {len(payload['items'])} items")
+        print(f"media library saved (legacy): {len(payload['items'])} items")
     except Exception as exc:  # noqa: BLE001
         print(f"media library save failed: {exc}")
 
 
+def load_settings():
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return
+    except Exception as exc:  # noqa: BLE001
+        print(f"settings load failed: {exc}")
+        return
+    with SETTINGS_LOCK:
+        SETTINGS["auto_switch_iap2"] = bool(
+            data.get("auto_switch_iap2", False))
+
+
+def save_settings():
+    with SETTINGS_LOCK:
+        payload = dict(SETTINGS)
+    tmp = SETTINGS_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, SETTINGS_PATH)
+
+
+def settings_snapshot():
+    with SETTINGS_LOCK:
+        return dict(SETTINGS)
+
+
+def media_cache_state():
+    with STATE_LOCK:
+        return {
+            "dates_loaded": bool(MEDIA_DATES["loaded"]),
+            "dates_count": len(MEDIA_DATES["dates"]),
+            "artwork_loaded": bool(MEDIA_ARTWORK["loaded"]),
+            "artwork_items": len(MEDIA_ARTWORK["items"]),
+            "artwork_albums": len(MEDIA_ARTWORK["albums"]),
+            "artwork_files": int(MEDIA_ARTWORK["files"]),
+            "cache_db": os.path.exists(_media_cache_path()),
+            "snapshot": os.path.exists(_snapshot_db()),
+            "library_id": _library_id(),
+        }
+
+
+def load_media_cache(target="all"):
+    """Load the on-disk cache into memory; never talks to the device."""
+    result = {}
+    with CACHE_LOCK:
+        if target in ("library", "all"):
+            result["library"] = load_media_dates(force=True)
+        if target in ("artwork", "all"):
+            result["artwork"] = load_media_artwork(force=True)
+    return result
+
+
+def _count_files(path):
+    if not os.path.isdir(path):
+        return 0
+    total = 0
+    for _, _, names in os.walk(path):
+        total += len(names)
+    return total
+
+
+def clear_local_cache():
+    """Delete the AFC-derived database/cache files and unload them."""
+    with CACHE_LOCK:
+        with STATE_LOCK:
+            dates_count = len(MEDIA_DATES["dates"])
+            items_count = len(MEDIA_ARTWORK["items"])
+            albums_count = len(MEDIA_ARTWORK["albums"])
+        cache_path = _media_cache_path()
+        artwork_dir = _artwork_dir()
+        snapshot_dir = _snapshot_dir()
+        stats = {
+            "library_id": _library_id(),
+            "dates_cleared": dates_count,
+            "artwork_items_cleared": items_count,
+            "artwork_albums_cleared": albums_count,
+            "artwork_files": _count_files(artwork_dir),
+            "snapshot_files": _count_files(snapshot_dir),
+            "cache_db_removed": False,
+        }
+
+        with LIBRARY_LOCK:
+            for item in LIBRARY["items"].values():
+                item.pop("date_added", None)
+                item.pop("date_added_source", None)
+            LIBRARY["version"] += 1
+            LIBRARY["_summary"] = None
+            LIBRARY["_songs"] = None
+            LIBRARY["_artists"] = None
+            LIBRARY["_genres"] = None
+            LIBRARY["_album_artists"] = None
+        with STATE_LOCK:
+            MEDIA_DATES.update({"mtime": 0.0, "dates": {},
+                                "loaded": False})
+            MEDIA_ARTWORK.update({"mtime": 0.0, "items": {}, "albums": {},
+                                  "loaded": False, "files": 0})
+            STATE["artwork_bytes"] = b""
+            STATE["artwork_ready_id"] = None
+            STATE["artwork_mime"] = "image/jpeg"
+            STATE["last_event"] = "Local MediaLibrary cache cleared"
+
+        delete_paths = [cache_path, cache_path + "-wal",
+                        cache_path + "-shm",
+                        MEDIA_CACHE_PATH, MEDIA_CACHE_PATH + "-wal",
+                        MEDIA_CACHE_PATH + "-shm",
+                        MEDIA_DATES_PATH, MEDIA_ARTWORK_PATH]
+        for path in delete_paths:
+            try:
+                os.unlink(path)
+                if path == cache_path:
+                    stats["cache_db_removed"] = True
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                print(f"cache delete {path}: {exc}")
+
+        for path in {artwork_dir, MEDIA_ARTWORK_DIR}:
+            shutil.rmtree(path, ignore_errors=True)
+            os.makedirs(path, exist_ok=True)
+
+        if os.path.isdir(snapshot_dir):
+            for name in os.listdir(snapshot_dir):
+                path = os.path.join(snapshot_dir, name)
+                if os.path.isfile(path):
+                    try:
+                        os.unlink(path)
+                    except OSError as exc:
+                        print(f"cache delete {path}: {exc}")
+        return stats
+
+
+def clear_iap2_library():
+    """Clear the iAP2 mirror and let the protocol perform a full resync."""
+    with LIBRARY_LOCK:
+        stats = {
+            "items_cleared": len(LIBRARY["items"]),
+            "playlists_cleared": len(LIBRARY["playlists"]),
+            "library_id": LIBRARY["library_id"],
+        }
+        LIBRARY["items"].clear()
+        LIBRARY["playlists"].clear()
+        LIBRARY["first_seen"].clear()
+        LIBRARY["first_seen_seq"].clear()
+        LIBRARY["revision"] = None
+        LIBRARY["next_seen_seq"] = 1
+        LIBRARY["batch_seq"] = None
+        LIBRARY["batch_last"] = 0.0
+        LIBRARY["dirty"] = False
+        LIBRARY["version"] += 1
+        LIBRARY["_summary"] = None
+        LIBRARY["_songs"] = None
+        LIBRARY["_artists"] = None
+        LIBRARY["_genres"] = None
+        LIBRARY["_album_artists"] = None
+        library_id = LIBRARY["library_id"]
+    if library_id:
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.unlink(str(device_store.paths(library_id)["iap2_db"]) +
+                          suffix)
+            except OSError:
+                pass
+    else:
+        try:
+            os.unlink(LIBRARY_PATH)
+        except OSError:
+            pass
+    with STATE_LOCK:
+        STATE["library_revision"] = None
+        STATE["last_event"] = "iAP2 media library cleared; resyncing"
+    conn = SESSION.conn
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return stats
+
+
+def clear_iap2_artwork():
+    cache_dir = _now_playing_dir()
+    stats = {"now_playing_files": _count_files(cache_dir)}
+    shutil.rmtree(cache_dir, ignore_errors=True)
+    os.makedirs(cache_dir, exist_ok=True)
+    with STATE_LOCK:
+        STATE["artwork_bytes"] = b""
+        STATE["artwork_ready_id"] = None
+        STATE["artwork_mime"] = "image/jpeg"
+        STATE["last_event"] = "iAP2 artwork cache cleared"
+    return stats
+
+
 def library_summary():
-    load_media_dates()
     with LIBRARY_LOCK:
         version = LIBRARY["version"]
         revision = LIBRARY["revision"]
@@ -986,6 +1356,7 @@ def song_entry(it):
         "track": it.get("track") or 0,
         "disc": it.get("disc") or 1,
         "first_seen": it.get("first_seen") or 0.0,
+        "first_seen_seq": it.get("first_seen_seq") or 1,
         "date_added": it.get("date_added"),
         "date_added_source": it.get("date_added_source"),
     }
@@ -1222,7 +1593,6 @@ def library_album_artist(name):
 def library_songs(query="", limit=100, offset=0, sort="title",
                   genre="", album_artist=""):
     """Paginated song list with search, filters and sorting."""
-    load_media_dates()
     with LIBRARY_LOCK:
         version = LIBRARY["version"]
         if (LIBRARY["_songs"] is None
@@ -1253,6 +1623,7 @@ def library_songs(query="", limit=100, offset=0, sort="title",
     sort = (sort or "title").lower()
     if sort == "recent":
         matches = sorted(matches, key=lambda e: (
+            -(e.get("first_seen_seq") or 1),
             -(e.get("date_added") or 0),
             -(e.get("first_seen") or 0),
             (e["title"] or "").lower()))
@@ -1294,12 +1665,12 @@ def library_recent(limit=100, offset=0):
     first_seen timestamp; older items carry 0.  The response says whether
     it is only an estimate / empty.
     """
-    load_media_dates()
     with LIBRARY_LOCK:
         rows = [it for it in LIBRARY["items"].values()
                 if (it.get("date_added") or 0) > 0
                 or (it.get("first_seen") or 0) > 0]
-    rows.sort(key=lambda it: (-(it.get("date_added") or 0),
+    rows.sort(key=lambda it: (-(it.get("first_seen_seq") or 1),
+                              -(it.get("date_added") or 0),
                               -(it.get("first_seen") or 0),
                               (it.get("title") or "").lower()))
     try:
@@ -1318,10 +1689,13 @@ def library_recent(limit=100, offset=0):
         "limit": limit,
         "items": [song_entry(it) for it in page],
         "supported": bool(MEDIA_DATES["dates"]),
-        "note": ("Date added from MediaLibrary.sqlitedb (via separate AFC "
-                 "importer)." if MEDIA_DATES["dates"] else
-                 ("Device does not provide date-added; sorted by MediaCtrl "
-                  "first-seen time. Legacy items are hidden.")),
+        "note": (
+            "Date added from MediaLibrary.sqlitedb (via separate AFC importer)."
+            if MEDIA_DATES["dates"] else
+            ("MediaLibrary date cache is not loaded; use Load MediaLibrary."
+             if os.path.exists(_media_cache_path()) else
+             ("No MediaLibrary cache; sorted by MediaCtrl first-seen time. "
+              "Legacy items are hidden."))),
         "estimated": not bool(MEDIA_DATES["dates"]),
     }
 
@@ -1419,6 +1793,9 @@ def snapshot():
             "last_event": STATE["last_event"],
         }
     out["queue"] = queue_snapshot(12)
+    out["media"] = MEDIA_JOBS.snapshot()
+    out["media"]["cache"] = media_cache_state()
+    out["settings"] = settings_snapshot()
     return out
 
 
@@ -1445,8 +1822,26 @@ class Session:
     def start(self):
         if self._thread and self._thread.is_alive():
             return
+        self._stop.clear()
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
+
+    def stop(self, timeout=8.0):
+        """Stop the reconnect loop and release the HID device."""
+        self._stop.set()
+        conn = self.conn
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout)
+        self._thread = None
+        with STATE_LOCK:
+            STATE["connected"] = False
+            STATE["link_state"] = None
 
     def _thread_main(self):
         while not self._stop.is_set():
@@ -1502,6 +1897,7 @@ class Session:
                 pass
             with LIBRARY_LOCK:
                 LIBRARY["syncing"] = False
+                LIBRARY["batch_seq"] = None
             save_library()
 
     async def _periodic_save(self):
@@ -1747,6 +2143,25 @@ class Session:
             self.conn.close()
         return True
 
+    def sync_library_incremental(self):
+        """Ask the device for an incremental media-library update."""
+        if not self.conn or not self.loop:
+            raise RuntimeError("iAP2 is not connected")
+        future = asyncio.run_coroutine_threadsafe(
+            self._sync_library_incremental(), self.loop)
+        return future.result(timeout=5)
+
+    async def _sync_library_incremental(self):
+        conn = self.conn
+        if conn is None:
+            raise RuntimeError("iAP2 is not connected")
+        with STATE_LOCK:
+            libs = list(STATE["libraries"])
+        local = self._local_library(libs)
+        if not local:
+            raise RuntimeError("Media library information is not ready")
+        await self._subscribe_library(conn, local["uuid"])
+        self._event("Incremental media library sync requested")
 
     # -- protocol handlers ------------------------------------------
     def _ft_handler(self, data):
@@ -1944,6 +2359,10 @@ class Session:
                     STATE["libraries"] = libs
                 local = self._local_library(libs)
                 if local:
+                    library_id = device_store.base_library_id(
+                        local.get("uuid"))
+                    if library_id and library_id != LIBRARY["library_id"]:
+                        switch_library(library_id, local.get("name"))
                     await self._subscribe_library(conn, local["uuid"])
             elif msg_id == 0x4C04:
                 rev, last7, items, playlists = self._apply_library_update(body)
@@ -1974,6 +2393,8 @@ class Session:
         with LIBRARY_LOCK:
             revision = LIBRARY["revision"]
             LIBRARY["syncing"] = True
+            if not revision:
+                LIBRARY["batch_seq"] = None
             LIBRARY["last_update"] = time.time()
         params = [
             csm.string(0, uuid),
@@ -2011,6 +2432,10 @@ class Session:
                 last7 = payload[0]
         with LIBRARY_LOCK:
             changed = False
+            now = time.time()
+            if (LIBRARY["batch_seq"] is not None
+                    and now - LIBRARY["batch_last"] > 5.0):
+                LIBRARY["batch_seq"] = None
             old_revision = LIBRARY["revision"]
             if reset and (LIBRARY["items"] or LIBRARY["playlists"]):
                 LIBRARY["items"].clear()
@@ -2025,11 +2450,25 @@ class Session:
             for item in items:
                 key = item.get("id")
                 if key:
+                    existing = LIBRARY["items"].get(key)
                     ts = LIBRARY["first_seen"].get(key)
                     if ts is None:
-                        ts = time.time()
+                        ts = now
                         LIBRARY["first_seen"][key] = ts
+                        if LIBRARY["batch_seq"] is None:
+                            LIBRARY["batch_seq"] = \
+                                LIBRARY["next_seen_seq"]
+                            LIBRARY["next_seen_seq"] += 1
+                        seq = LIBRARY["batch_seq"]
+                        LIBRARY["batch_last"] = now
+                    else:
+                        seq = int(
+                            LIBRARY["first_seen_seq"].get(key)
+                            or (existing or {}).get("first_seen_seq")
+                            or 1)
                     item["first_seen"] = ts
+                    item["first_seen_seq"] = seq
+                    LIBRARY["first_seen_seq"][key] = seq
                     LIBRARY["items"][key] = item
                     changed = True
             for pl in playlists:
@@ -2064,6 +2503,33 @@ class Session:
 SESSION = Session()
 
 
+def _session_ready():
+    with STATE_LOCK:
+        return bool(STATE["connected"] and STATE["link_state"] == 2)
+
+
+def _reload_media_cache(target="all"):
+    with CACHE_LOCK:
+        if target in ("library", "all"):
+            load_media_dates(force=True)
+        if target in ("artwork", "all"):
+            load_media_artwork(force=True)
+
+
+def _auto_switch_iap2():
+    return bool(settings_snapshot().get("auto_switch_iap2", False))
+
+
+MEDIA_JOBS = media_jobs.MediaJobs(
+    stop_session=SESSION.stop,
+    start_session=SESSION.start,
+    session_ready=_session_ready,
+    reload_cache=_reload_media_cache,
+    auto_switch=_auto_switch_iap2,
+    clear_cache=clear_local_cache,
+)
+
+
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
@@ -2074,6 +2540,7 @@ INDEX_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>MediaCtrl / iAP2</title>
+<link rel="stylesheet" href="/static/bootstrap-icons/bootstrap-icons.min.css">
 <style>
   :root {
     --bg: #22262a;
@@ -2110,6 +2577,62 @@ INDEX_HTML = r"""<!doctype html>
   .dot.ok { background: var(--ok); box-shadow: 0 0 10px #b9c8bf88; }
   .dot.warn { background: var(--warn); box-shadow: 0 0 10px #d1c5ad88; }
   .brand { letter-spacing: .08em; text-transform: uppercase; font-size: 12px; }
+  .top-actions { display: flex; align-items: center; gap: 8px; }
+  .top-btn {
+    width: auto; height: 26px; min-height: 26px; padding: 0 10px;
+    border-radius: 8px; font-size: 10px; line-height: 1;
+    display: inline-flex; align-items: center; gap: 6px;
+    letter-spacing: .04em; background: #ffffff0d;
+    border: 1px solid #ffffff12; color: var(--text);
+  }
+  .top-btn:hover:not(:disabled) { background: #ffffff1c; transform: none; }
+  .top-btn.active { background: #3e464e; border-color: #6b747e; }
+  .top-btn .num { color: var(--muted); font-size: 9px; }
+  .modal-card.media-card {
+    width: min(760px, 100%); max-height: 90vh; overflow-y: auto;
+  }
+  .media-section { margin: 10px 0 4px; }
+  .media-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+    margin-top: 10px;
+  }
+  .media-column {
+    min-width: 0; padding: 10px; border: 1px solid var(--line-soft);
+    border-radius: 10px;
+  }
+  .media-column h4 {
+    margin: 0 0 8px; padding: 0 0 6px; font-size: 11px;
+    letter-spacing: .12em; text-transform: uppercase;
+    color: var(--text); border-bottom: 1px solid var(--line-soft);
+  }
+  .media-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+  .media-actions button {
+    width: auto; height: 32px; border-radius: 8px; padding: 0 12px;
+    font-size: 11px;
+  }
+  .media-actions button.main {
+    width: auto; height: 32px; font-size: 11px; box-shadow: none;
+  }
+  .media-actions button.danger {
+    border-color: #8a5b5b; color: #e0b3b3;
+  }
+  .media-check {
+    display: flex; align-items: center; gap: 8px;
+    margin: 8px 0; font-size: 11px; color: var(--muted);
+  }
+  .media-check input {
+    width: 14px; height: 14px; margin: 0; accent-color: #8a949e;
+  }
+  .bar.media-bar { height: 8px; margin-top: 8px; }
+  .media-nums {
+    display: flex; flex-direction: column; gap: 2px;
+    margin-top: 8px; font-size: 11px; color: var(--muted);
+  }
+  .media-error {
+    color: var(--err); font-size: 11px; margin-top: 8px;
+    white-space: pre-wrap;
+  }
+  .media-hint { color: var(--muted); font-size: 10px; margin-top: 8px; }
   .layout {
     display: grid; grid-template-columns: 360px minmax(0, 1fr);
     gap: 12px; align-items: start;
@@ -2731,19 +3254,31 @@ INDEX_HTML = r"""<!doctype html>
     .library-panel .media-wrap { flex: none; max-height: 520px; }
   }
   @media (max-width: 760px) {
+    .topbar { flex-wrap: wrap; gap: 8px; }
+    .top-actions { flex-wrap: wrap; justify-content: flex-end; }
+    .media-grid { grid-template-columns: 1fr; }
     .media-table .album-col, .media-table .artist { display: none; }
     .media-table .title { width: 55%; }
     .media-table th, .media-table td { padding: 7px 8px; }
     .media-table .num { width: 54px; }
     .media-table .actions { width: 104px; }
   }
+  .bi { vertical-align: -0.08em; }
+  button .bi, .tab .bi { margin-right: 5px; }
+  button.icon-only .bi, .icon-btn .bi, .play .bi { margin-right: 0; }
+  /* Flat UI: square corners everywhere; status dot stays circular. */
+  *, *::before, *::after { border-radius: 0 !important; }
+  .dot { border-radius: 50% !important; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <div class="topbar">
     <div class="brand">MediaCtrl / iAP2</div>
-    <div><span class="dot" id="conn-dot"></span><span id="conn-text">Connecting…</span></div>
+    <div class="top-actions">
+      <button id="btn-media" class="top-btn"><i class="bi bi-collection"></i> MediaLibrary</button>
+      <div><span class="dot" id="conn-dot"></span><span id="conn-text">Connecting…</span></div>
+    </div>
   </div>
 
   <div class="layout">
@@ -2770,20 +3305,20 @@ INDEX_HTML = r"""<!doctype html>
       </div>
 
       <div class="controls">
-        <button id="btn-prev" title="Previous">Prev</button>
-        <button id="btn-toggle" class="main" title="Play/Pause">Play</button>
-        <button id="btn-next" title="Next">Next</button>
+        <button id="btn-prev" class="icon-only" title="Previous" aria-label="Previous"><i class="bi bi-skip-start-fill"></i></button>
+        <button id="btn-toggle" class="main icon-only" title="Play/Pause" aria-label="Play"><i class="bi bi-play-fill"></i></button>
+        <button id="btn-next" class="icon-only" title="Next" aria-label="Next"><i class="bi bi-skip-end-fill"></i></button>
       </div>
       <div class="extra-controls">
         <div class="volume-row">
-          <button id="btn-vol-down" title="Volume down">Vol -</button>
-          <button id="btn-vol-up" title="Volume up">Vol +</button>
-          <button id="btn-mute" title="Mute">Mute</button>
+          <button id="btn-vol-down" class="icon-only" title="Volume down" aria-label="Volume down"><i class="bi bi-volume-down-fill"></i></button>
+          <button id="btn-vol-up" class="icon-only" title="Volume up" aria-label="Volume up"><i class="bi bi-volume-up-fill"></i></button>
+          <button id="btn-mute" class="icon-only" title="Mute" aria-label="Mute"><i class="bi bi-volume-mute-fill"></i></button>
         </div>
-        <button id="btn-shuffle" title="Shuffle">Shuffle Off</button>
-        <button id="btn-repeat" title="Repeat mode">Repeat: Off</button>
-        <button id="btn-stop" title="Stop">Stop</button>
-        <button id="btn-current-selection" title="Resume iPod queue">Resume queue</button>
+        <button id="btn-shuffle" class="icon-only" title="Shuffle off" aria-label="Shuffle"><i class="bi bi-shuffle"></i></button>
+        <button id="btn-repeat" class="icon-only" title="Repeat off" aria-label="Repeat"><i class="bi bi-repeat"></i></button>
+        <button id="btn-stop" class="icon-only" title="Stop" aria-label="Stop"><i class="bi bi-stop-fill"></i></button>
+        <button id="btn-current-selection" title="Resume iPod queue"><i class="bi bi-collection-play"></i> Resume queue</button>
       </div>
     </div>
     <div class="panel queue-panel">
@@ -2796,7 +3331,7 @@ INDEX_HTML = r"""<!doctype html>
     <div class="panel library-info-panel">
       <div class="panel-head">
         <h3>Library</h3>
-        <button id="btn-resync" class="small-btn" title="Clear local mirror and resync">Resync</button>
+        <button id="btn-resync" class="small-btn" title="Clear local mirror and resync"><i class="bi bi-arrow-clockwise"></i> Resync</button>
       </div>
       <div class="kv"><span>Tracks</span><span id="lib-tracks">—</span></div>
       <div class="kv"><span>Albums</span><span id="lib-albums-count">—</span></div>
@@ -2819,20 +3354,21 @@ INDEX_HTML = r"""<!doctype html>
         <h3>Browser</h3>
       </div>
       <div class="lib-tabs">
-        <button class="tab active" data-tab="albums">Albums</button>
-        <button class="tab" data-tab="artists">Artists</button>
-        <button class="tab" data-tab="album-artists">Album Artists</button>
-        <button class="tab" data-tab="genres">Genres</button>
-        <button class="tab" data-tab="songs">Songs</button>
-        <button class="tab" data-tab="recent">Recently Added</button>
-        <button class="tab" data-tab="playlists">Device Playlists</button>
+        <button class="tab active" data-tab="albums"><i class="bi bi-disc"></i> Albums</button>
+        <button class="tab" data-tab="artists"><i class="bi bi-person"></i> Artists</button>
+        <button class="tab" data-tab="album-artists"><i class="bi bi-people"></i> Album Artists</button>
+        <button class="tab" data-tab="genres"><i class="bi bi-tag"></i> Genres</button>
+        <button class="tab" data-tab="songs"><i class="bi bi-music-note-list"></i> Songs</button>
+        <button class="tab" data-tab="recent"><i class="bi bi-clock-history"></i> Recently Added</button>
+        <button class="tab" data-tab="localPlaylist"><i class="bi bi-list-check"></i> localPlaylist</button>
+        <button class="tab" data-tab="playlists"><i class="bi bi-collection-play"></i> Device Playlists</button>
       </div>
       <div class="lib-tools">
         <input id="lib-search" placeholder="Search albums…">
       </div>
       <div class="tab-pane active" id="pane-albums">
         <div class="album-toolbar">
-          <button id="albums-sort-btn" class="sort-btn">Sort: Recently Added / Desc</button>
+          <button id="albums-sort-btn" class="sort-btn"><i class="bi bi-sort-down"></i> Sort: Recently Added / Desc</button>
           <div class="sort-menu" id="albums-sort-menu">
             <button data-album-sort="recent">Recently Added</button>
             <button data-album-sort="name">Name</button>
@@ -2847,19 +3383,19 @@ INDEX_HTML = r"""<!doctype html>
       <div class="tab-pane" id="pane-artists">
         <div class="album-list" id="lib-artists"></div>
         <div class="more-row">
-          <button id="btn-more-artists" style="display:none">Load more artists</button>
+          <button id="btn-more-artists" style="display:none"><i class="bi bi-chevron-down"></i> Load more artists</button>
         </div>
       </div>
       <div class="tab-pane" id="pane-album-artists">
         <div class="album-list" id="lib-album-artists"></div>
         <div class="more-row">
-          <button id="btn-more-album-artists" style="display:none">Load more album artists</button>
+          <button id="btn-more-album-artists" style="display:none"><i class="bi bi-chevron-down"></i> Load more album artists</button>
         </div>
       </div>
       <div class="tab-pane" id="pane-genres">
         <div class="album-list" id="lib-genres"></div>
         <div class="more-row">
-          <button id="btn-more-genres" style="display:none">Load more genres</button>
+          <button id="btn-more-genres" style="display:none"><i class="bi bi-chevron-down"></i> Load more genres</button>
         </div>
       </div>
       <div class="tab-pane" id="pane-songs">
@@ -2874,15 +3410,22 @@ INDEX_HTML = r"""<!doctype html>
         </div>
         <div class="album-list" id="lib-songs"></div>
         <div class="more-row">
-          <button id="btn-more-songs" style="display:none">Load more songs</button>
+          <button id="btn-more-songs" style="display:none"><i class="bi bi-chevron-down"></i> Load more songs</button>
         </div>
       </div>
       <div class="tab-pane" id="pane-recent">
         <div class="lib-note" id="recent-note"></div>
         <div class="album-list" id="lib-recent"></div>
         <div class="more-row">
-          <button id="btn-more-recent" style="display:none">Load more</button>
+          <button id="btn-more-recent" style="display:none"><i class="bi bi-chevron-down"></i> Load more</button>
         </div>
+      </div>
+      <div class="tab-pane" id="pane-localPlaylist">
+        <div class="lib-tools" style="margin-bottom:8px">
+          <button id="btn-play-localPlaylist"><i class="bi bi-play-fill"></i> Play localPlaylist</button>
+          <span class="lib-note" id="localPlaylist-note"></span>
+        </div>
+        <div class="album-list" id="lib-localPlaylist"></div>
       </div>
       <div class="tab-pane" id="pane-playlists">
         <div class="album-list" id="lib-playlists"></div>
@@ -2892,8 +3435,8 @@ INDEX_HTML = r"""<!doctype html>
           <img class="detail-cover" id="detail-cover" alt="">
           <div class="t" id="detail-title"></div>
           <div class="s" id="detail-sub"></div>
-          <button id="btn-play-detail">Play</button>
-          <button id="btn-detail-close">Close</button>
+          <button id="btn-play-detail"><i class="bi bi-play-fill"></i> Play</button>
+          <button id="btn-detail-close"><i class="bi bi-x-lg"></i> Close</button>
         </div>
         <div class="detail-actions" id="detail-actions"></div>
         <div class="track-list" id="detail-tracks"></div>
@@ -2902,15 +3445,82 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </div>
 <div class="toast" id="toast"></div>
-<div class="modal" id="pl-modal">
-  <div class="modal-card">
-    <h3 id="pl-modal-title">Add to playlist</h3>
-    <div class="modal-list" id="pl-modal-list"></div>
-    <div class="modal-new">
-      <input id="pl-modal-new" placeholder="New playlist name…">
-      <button id="pl-modal-create">Create & add</button>
+<div class="modal" id="media-modal">
+  <div class="modal-card media-card">
+    <h3>MediaLibrary</h3>
+    <div class="media-section">
+      <div class="kv"><span>Mode</span><span id="media-mode">—</span></div>
+      <div class="kv"><span>Device</span><span id="media-device">—</span></div>
+      <div class="kv"><span>Library ID</span><span id="media-library-id">—</span></div>
+      <div class="kv"><span>Pairing</span><span id="media-paired">—</span></div>
     </div>
-    <button class="modal-close" id="pl-modal-close">Cancel</button>
+    <div class="media-grid">
+      <section class="media-column">
+        <h4>AFC</h4>
+        <div class="media-actions">
+          <button id="media-pair"><i class="bi bi-link-45deg"></i> Pair / Trust</button>
+          <button id="media-clear" class="danger"><i class="bi bi-trash"></i> Clear AFC Cache</button>
+        </div>
+        <div class="media-section">
+          <div class="kv"><span>MediaLibrary cache</span><span id="media-library-state">Not loaded</span></div>
+          <div class="media-actions">
+            <button id="media-load-library"><i class="bi bi-box-arrow-in-down"></i> Load MediaLibrary</button>
+            <button id="media-update-library"><i class="bi bi-cloud-download"></i> Update MediaLibrary</button>
+          </div>
+        </div>
+        <div class="media-section">
+          <div class="kv"><span>Artwork cache</span><span id="media-artwork-state">Not loaded</span></div>
+          <div class="media-actions">
+            <button id="media-load-artwork"><i class="bi bi-image"></i> Load Artwork</button>
+            <button id="media-update-artwork"><i class="bi bi-cloud-download"></i> Update Artwork</button>
+          </div>
+        </div>
+        <div class="media-section">
+          <div class="kv"><span>Combined sync</span><span>Updates both AFC caches</span></div>
+          <div class="media-actions">
+            <button id="media-quick" class="main"><i class="bi bi-arrow-repeat"></i> Quick Sync</button>
+            <button id="media-full"><i class="bi bi-arrow-clockwise"></i> Full Refresh</button>
+            <button id="media-cancel" class="danger" style="display:none"><i class="bi bi-x-circle"></i> Cancel</button>
+          </div>
+        </div>
+      </section>
+      <section class="media-column">
+        <h4>iAP2</h4>
+        <div class="media-actions">
+          <button id="media-switch-iap2"><i class="bi bi-arrow-left-right"></i> Switch to iAP2</button>
+        </div>
+        <div class="media-section">
+          <div class="kv"><span>iAP2 library</span><span id="iap2-library-state">Connected</span></div>
+          <div class="media-actions">
+            <button id="iap2-sync"><i class="bi bi-arrow-repeat"></i> Sync iAP2</button>
+            <button id="iap2-resync"><i class="bi bi-arrow-clockwise"></i> Full Resync</button>
+          </div>
+        </div>
+        <div class="media-section">
+          <div class="media-actions">
+            <button id="iap2-clear-library" class="danger"><i class="bi bi-trash"></i> Clear iAP2 Library</button>
+            <button id="iap2-clear-artwork" class="danger"><i class="bi bi-eraser"></i> Clear iAP2 Artwork</button>
+          </div>
+        </div>
+        <label class="media-check">
+          <input type="checkbox" id="media-auto-iap2">
+          Auto switch to iAP2 after AFC tasks
+        </label>
+      </section>
+    </div>
+    <div class="media-hint">
+      AFC: loading reads an existing local cache; updating switches the device
+      to AFC, pulls from the device, and loads the result. iAP2: Sync asks for
+      an incremental update; Full Resync clears the revision and reconnects.
+      Clearing the iAP2 library lets the protocol perform a full resync.
+    </div>
+    <div class="media-section">
+      <div class="kv"><span>Stage</span><span id="media-stage">Idle</span></div>
+      <div class="bar media-bar"><span id="media-bar"></span></div>
+      <div class="media-nums" id="media-nums"></div>
+      <div class="media-error" id="media-error"></div>
+    </div>
+    <button class="modal-close" id="media-close"><i class="bi bi-x-lg"></i> Close</button>
   </div>
 </div>
 
@@ -2920,11 +3530,24 @@ const STATUS = {0: "Stopped", 1: "Playing", 2: "Paused", 3: "Seeking forward", 4
 const LINK = {0: "Detecting", 1: "Negotiating", 2: "Ready", 3: "Disconnected"};
 let state = null;
 let shownArt = null;
+let lastLibraryId = null;
 
 function fmt(ms) {
   ms = Math.max(0, ms || 0);
   const s = Math.floor(ms / 1000);
   return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+}
+
+function fmtNum(n) {
+  return Number(n || 0).toLocaleString("en-US");
+}
+
+function fmtBytes(n) {
+  n = Number(n || 0);
+  if (n >= 1024 * 1024 * 1024) return (n / (1024 ** 3)).toFixed(2) + " GB";
+  if (n >= 1024 * 1024) return (n / (1024 ** 2)).toFixed(1) + " MB";
+  if (n >= 1024) return (n / 1024).toFixed(1) + " KB";
+  return fmtNum(n) + " B";
 }
 
 function toast(msg) {
@@ -2950,11 +3573,41 @@ function render(s) {
   const np = s.now_playing || {};
   const connected = !!s.connected;
   const linkOk = s.link_state === 2;
+  const media = s.media || {};
+  const activeLibraryId = (media.cache || {}).library_id;
+  if (activeLibraryId && activeLibraryId !== lastLibraryId) {
+    lastLibraryId = activeLibraryId;
+    setTimeout(async () => {
+      await pollLibrary();
+      renderActiveTab(true);
+    }, 100);
+  }
+  const mediaJob = media.job || null;
+  const mediaBusy = !!(mediaJob &&
+      (mediaJob.state === "running" || mediaJob.state === "cancelling"));
 
-  $("#conn-dot").className = "dot " + (connected && linkOk ? "ok" : (connected ? "warn" : ""));
-  $("#conn-text").textContent = connected
-      ? (linkOk ? "Connected" : "Negotiating link…")
-      : "Waiting for iPod…";
+  $("#btn-media").classList.toggle(
+      "active", media.mode === "afc" || mediaBusy);
+  if (mediaBusy && mediaJob.total > 0) {
+    $("#btn-media").innerHTML = "MediaLibrary " +
+        `<span class="num">${fmtNum(mediaJob.done)}/${fmtNum(mediaJob.total)}</span>`;
+  } else {
+    $("#btn-media").textContent = "MediaLibrary";
+  }
+
+  if (media.mode === "afc") {
+    $("#conn-dot").className = "dot warn";
+    $("#conn-text").textContent = "MediaLibrary mode";
+  } else if (media.mode === "switching") {
+    $("#conn-dot").className = "dot warn";
+    $("#conn-text").textContent = "Switching…";
+  } else {
+    $("#conn-dot").className = "dot " +
+        (connected && linkOk ? "ok" : (connected ? "warn" : ""));
+    $("#conn-text").textContent = connected
+        ? (linkOk ? "Connected" : "Negotiating link…")
+        : "Waiting for device…";
+  }
 
   const status = np.status;
   const badge = $("#state-badge");
@@ -2975,14 +3628,19 @@ function render(s) {
     $("#queue").textContent = "";
   }
   const REPEAT = ["Off", "One", "All"];
-  $("#btn-shuffle").textContent = np.shuffle == null
-      ? "Shuffle —" : (np.shuffle ? "Shuffle On" : "Shuffle Off");
-  $("#btn-repeat").textContent = "Repeat: " +
-      (np.repeat == null ? "—" : (REPEAT[np.repeat] || np.repeat));
-  $("#btn-shuffle").classList.toggle("on",
-      np.shuffle === 1 || np.shuffle === 2);
-  $("#btn-repeat").classList.toggle("on",
-      np.repeat === 1 || np.repeat === 2);
+  const shuffleOn = np.shuffle === 1 || np.shuffle === 2;
+  const repeatOn = np.repeat === 1 || np.repeat === 2;
+  $("#btn-shuffle").innerHTML = '<i class="bi bi-shuffle"></i>';
+  $("#btn-shuffle").title = np.shuffle == null
+      ? "Shuffle unknown" : (shuffleOn ? "Shuffle on" : "Shuffle off");
+  $("#btn-shuffle").setAttribute("aria-label", $("#btn-shuffle").title);
+  $("#btn-repeat").innerHTML = np.repeat === 1
+      ? '<i class="bi bi-repeat-1"></i>' : '<i class="bi bi-repeat"></i>';
+  $("#btn-repeat").title = "Repeat " +
+      (np.repeat == null ? "unknown" : (REPEAT[np.repeat] || np.repeat));
+  $("#btn-repeat").setAttribute("aria-label", $("#btn-repeat").title);
+  $("#btn-shuffle").classList.toggle("on", shuffleOn);
+  $("#btn-repeat").classList.toggle("on", repeatOn);
   const details = [];
   if (np.album_artist) details.push(np.album_artist);
   if (np.genre) details.push(np.genre);
@@ -3034,7 +3692,10 @@ function render(s) {
                     "#btn-mute", "#btn-stop", "#btn-current-selection"]) {
     $(id).disabled = !canControl;
   }
-  $("#btn-toggle").textContent = status === 1 ? "Pause" : "Play";
+  $("#btn-toggle").innerHTML = status === 1
+      ? '<i class="bi bi-pause-fill"></i>' : '<i class="bi bi-play-fill"></i>';
+  $("#btn-toggle").title = status === 1 ? "Pause" : "Play";
+  $("#btn-toggle").setAttribute("aria-label", $("#btn-toggle").title);
 
   $("#kv-conn").textContent = connected ? "Authenticated" : "Disconnected";
   $("#kv-link").textContent = LINK[s.link_state] ?? "—";
@@ -3060,6 +3721,147 @@ function render(s) {
     $("#libs").innerHTML =
         '<div class="kv"><span>Library</span><span>—</span></div>';
   }
+
+  renderMedia(media, s.settings || {});
+}
+
+function mediaModeLabel(mode) {
+  return ({
+    iap2: "iAP2",
+    afc: "MediaLibrary (AFC)",
+    switching: "Switching…",
+    unknown: "Unknown",
+  })[mode] || "—";
+}
+
+function renderMedia(media, settings) {
+  const job = media.job || null;
+  const cache = media.cache || {};
+  const busy = !!(job &&
+      (job.state === "running" || job.state === "cancelling"));
+  $("#media-mode").textContent = mediaModeLabel(media.mode);
+  $("#media-device").textContent = media.device || media.udid || "—";
+  $("#media-library-id").textContent = cache.library_id || "—";
+  $("#media-paired").textContent = media.paired === true
+      ? "Paired" : (media.paired === false ? "Not paired" : "Unknown");
+  const libs = (state && state.libraries) || [];
+  const localLib = libs.find(l => l.type === 0) || libs[0];
+  if (localLib) {
+    $("#iap2-library-state").textContent =
+        `${localLib.name || "Unknown"} · ${libs.length} libraries`;
+  } else {
+    $("#iap2-library-state").textContent = "Not available";
+  }
+
+  let libState;
+  if (cache.dates_loaded) {
+    libState = `Loaded · ${fmtNum(cache.dates_count)} dates`;
+  } else if (cache.cache_db) {
+    libState = "Not loaded · cache file present";
+  } else {
+    libState = "No cache file";
+  }
+  $("#media-library-state").textContent = libState;
+
+  let artState;
+  if (cache.artwork_loaded) {
+    artState = `Loaded · ${fmtNum(cache.artwork_items)} items · ` +
+        `${fmtNum(cache.artwork_files)} files`;
+  } else if (cache.cache_db) {
+    artState = "Not loaded · cache file present";
+  } else {
+    artState = "No cache file";
+  }
+  $("#media-artwork-state").textContent = artState;
+
+  $("#media-auto-iap2").checked = !!(settings && settings.auto_switch_iap2);
+  $("#media-auto-iap2").disabled = busy;
+
+  $("#media-stage").textContent = job
+      ? (job.message || job.stage || "—") : "Idle";
+  let pct = 0;
+  if (job && job.total > 0) {
+    pct = Math.max(0, Math.min(100, 100 * job.done / job.total));
+  }
+  $("#media-bar").style.width = pct.toFixed(1) + "%";
+
+  const stats = (job && job.stats) || {};
+  const rows = [];
+  const add = (label, value) => {
+    if (value !== undefined && value !== null && value !== "") {
+      rows.push(`<div class="kv"><span>${label}</span><span>${value}</span></div>`);
+    }
+  };
+  if (job && job.total > 0) {
+    const unit = job.unit || "items";
+    add("Progress", `${fmtNum(job.done)} / ${fmtNum(job.total)} ${unit}`);
+  }
+  if (job && job.bytes_total > 0) {
+    add("Data", `${fmtBytes(job.bytes_done)} / ${fmtBytes(job.bytes_total)}`);
+  }
+  add("Library rows", stats.rows !== undefined ? fmtNum(stats.rows) : null);
+  add("Matched items",
+      stats.matched_library_items !== undefined
+          ? fmtNum(stats.matched_library_items) : null);
+  add("New dates", stats.new !== undefined ? fmtNum(stats.new) : null);
+  add("Updated dates", stats.updated !== undefined ? fmtNum(stats.updated) : null);
+  add("Removed dates", stats.removed !== undefined ? fmtNum(stats.removed) : null);
+  add("Required artwork",
+      stats.required_files !== undefined ? fmtNum(stats.required_files) : null);
+  add("Reused artwork",
+      stats.reused_files !== undefined ? fmtNum(stats.reused_files) : null);
+  add("New artwork", stats.copy_files !== undefined
+      ? fmtNum(stats.copy_files) : null);
+  add("Copied", stats.copied !== undefined ? fmtNum(stats.copied) : null);
+  add("Skipped", stats.skipped !== undefined ? fmtNum(stats.skipped) : null);
+  add("Failed", stats.failed !== undefined ? fmtNum(stats.failed) : null);
+  add("Thumbnails", stats.thumbs !== undefined ? fmtNum(stats.thumbs) : null);
+  add("Deleted", stats.deleted_files !== undefined
+      ? fmtNum(stats.deleted_files) : null);
+  add("New item mappings", stats.new_items !== undefined
+      ? fmtNum(stats.new_items) : null);
+  add("Changed item mappings", stats.changed_items !== undefined
+      ? fmtNum(stats.changed_items) : null);
+  add("Removed item mappings", stats.removed_items !== undefined
+      ? fmtNum(stats.removed_items) : null);
+  add("New album mappings", stats.new_albums !== undefined
+      ? fmtNum(stats.new_albums) : null);
+  add("New artwork files", stats.new_files !== undefined
+      ? fmtNum(stats.new_files) : null);
+  add("Removed files", stats.removed_files !== undefined
+      ? fmtNum(stats.removed_files) : null);
+  add("Cache items", stats.items !== undefined ? fmtNum(stats.items) : null);
+  add("Cache albums", stats.albums !== undefined ? fmtNum(stats.albums) : null);
+  add("Cache files", stats.files !== undefined ? fmtNum(stats.files) : null);
+  add("Cleared dates", stats.dates_cleared !== undefined
+      ? fmtNum(stats.dates_cleared) : null);
+  add("Cleared artwork files", stats.artwork_files !== undefined
+      ? fmtNum(stats.artwork_files) : null);
+  add("Cleared Now Playing", stats.now_playing_files !== undefined
+      ? fmtNum(stats.now_playing_files) : null);
+  add("Cleared snapshots", stats.snapshot_files !== undefined
+      ? fmtNum(stats.snapshot_files) : null);
+  add("Cache DB removed", stats.cache_db_removed !== undefined
+      ? (stats.cache_db_removed ? "Yes" : "No") : null);
+  $("#media-nums").innerHTML = rows.join("");
+  $("#media-error").textContent = (job && job.error) || "";
+
+  $("#media-pair").disabled = busy;
+  $("#media-quick").disabled = busy;
+  $("#media-full").disabled = busy;
+  $("#media-load-library").disabled = busy || !cache.cache_db;
+  $("#media-update-library").disabled = busy;
+  $("#media-load-artwork").disabled = busy || !cache.cache_db;
+  $("#media-update-artwork").disabled = busy;
+  $("#media-switch-iap2").disabled = busy || media.mode === "iap2";
+  $("#media-clear").disabled = busy;
+  const iap2Ready = media.mode === "iap2" && state && state.connected;
+  $("#iap2-sync").disabled = busy || !iap2Ready;
+  $("#iap2-resync").disabled = busy || !iap2Ready;
+  $("#iap2-clear-library").disabled = busy;
+  $("#iap2-clear-artwork").disabled = busy;
+  $("#media-cancel").style.display = busy ? "inline-flex" : "none";
+  $("#media-cancel").disabled = !busy;
 }
 
 function tick() {
@@ -3114,7 +3916,6 @@ let activeTab = "albums";
 let albumSort = "recent";
 let albumDir = "desc";
 let lastAlbumKey = null;
-let pendingAddItem = null;
 
 let artistsOffset = 0;
 let artistsTotal = 0;
@@ -3183,6 +3984,14 @@ const TABLE_COLS = {
     {label: "Album", cls: "album-col"},
     {label: "Time", cls: "num"},
     {label: "Added", cls: "num date-col"},
+    {label: "", cls: "actions"},
+  ],
+  localPlaylist: [
+    {label: "#", cls: "num col-index"},
+    {label: "Song", cls: "title"},
+    {label: "Artist", cls: "artist"},
+    {label: "Album", cls: "album-col"},
+    {label: "Time", cls: "num"},
     {label: "", cls: "actions"},
   ],
   playlists: [
@@ -3258,6 +4067,7 @@ function renderActiveTab(force) {
   else if (activeTab === "genres") loadGenres(true);
   else if (activeTab === "recent") loadRecent(true);
   else if (activeTab === "songs") loadSongs(true);
+  else if (activeTab === "localPlaylist") loadLocalPlaylist();
   else if (activeTab === "playlists") loadPlaylists();
 }
 
@@ -3274,6 +4084,7 @@ function setTab(name) {
     genres: "Search genres…",
     songs: "Search songs / artists / albums…",
     recent: "Search recently added…",
+    localPlaylist: "Search localPlaylist…",
     playlists: "Search device playlists…",
   }[name] || "Search…";
   $("#lib-search").placeholder = ph;
@@ -3302,8 +4113,9 @@ function compareAlbums(a, b) {
 
 function updateAlbumSortUI() {
   const labels = {recent: "Recently Added", name: "Name", artist: "Artist"};
-  $("#albums-sort-btn").textContent =
-      `Sort: ${labels[albumSort]} / ${albumDir === "asc" ? "Asc" : "Desc"}`;
+  $("#albums-sort-btn").innerHTML =
+      `<i class="bi bi-sort-down"></i> Sort: ${labels[albumSort]} / ` +
+      `${albumDir === "asc" ? "Asc" : "Desc"}`;
   document.querySelectorAll("#albums-sort-menu button").forEach(btn => {
     const match = (btn.dataset.albumSort && btn.dataset.albumSort === albumSort) ||
                   (btn.dataset.albumDir && btn.dataset.albumDir === albumDir);
@@ -3486,6 +4298,34 @@ async function loadSongs(reset) {
 }
 
 
+async function loadLocalPlaylist() {
+  try {
+    const d = await apiJson("/api/playlists/localPlaylist",
+                            {cache: "no-store"});
+    if (!d.ok) {
+      $("#lib-localPlaylist").innerHTML =
+          mediaTable(TABLE_COLS.localPlaylist, [], "localPlaylist unavailable");
+      return;
+    }
+    const q = ($("#lib-search").value || "").trim().toLowerCase();
+    const items = (d.items || []).filter(t =>
+        !q || (t.title || "").toLowerCase().includes(q) ||
+        (t.artist || "").toLowerCase().includes(q) ||
+        (t.album || "").toLowerCase().includes(q));
+    $("#lib-localPlaylist").innerHTML = mediaTable(
+        TABLE_COLS.localPlaylist,
+        items.map((t, i) => trackRow(
+            t, i + 1,
+            '<button class="icon-btn" data-remove="1" title="Remove"><i class="bi bi-dash-lg"></i></button>')),
+        "localPlaylist is empty");
+    $("#localPlaylist-note").textContent =
+        `${(d.items || []).length} tracks · CSV-backed`;
+  } catch (e) {
+    $("#lib-localPlaylist").innerHTML =
+        mediaTable(TABLE_COLS.localPlaylist, [], "localPlaylist load failed");
+  }
+}
+
 async function loadPlaylists() {
   const q = ($("#lib-search").value || "").trim().toLowerCase();
   const rows = [];
@@ -3514,9 +4354,14 @@ function trackRow(t, idx, actions, withDate) {
       ${withDate ? `<td class="num date-col">${fmtDate(t.date_added)}</td>` : ""}
       <td class="actions">
         ${actions || ""}
-        <span class="play">Play</span>
+        <span class="play" title="Play"><i class="bi bi-play-fill"></i></span>
       </td>
     </tr>`;
+}
+
+function setPlayDetail(label) {
+  $("#btn-play-detail").innerHTML =
+      '<i class="bi bi-play-fill"></i> ' + label;
 }
 
 function showDetail() {
@@ -3551,7 +4396,7 @@ async function showAlbum(pid, artist, album) {
     $("#detail-title").textContent = d.album.album || album || "Unknown album";
     $("#detail-sub").textContent =
         (d.album.artist || artist || "") + " · " + d.items.length + " tracks";
-    $("#btn-play-detail").textContent = "Play album";
+    setPlayDetail("Play album");
     $("#btn-play-detail").style.display = d.album.pid ? "" : "none";
     $("#detail-actions").innerHTML = "";
     $("#detail-tracks").innerHTML = mediaTable(
@@ -3577,7 +4422,7 @@ async function showArtist(pid, name) {
     $("#detail-title").textContent = d.artist.name || name || "Unknown artist";
     $("#detail-sub").textContent =
         `${d.artist.albums} albums · ${d.artist.tracks} tracks`;
-    $("#btn-play-detail").textContent = "Play artist";
+    setPlayDetail("Play artist");
     $("#btn-play-detail").style.display = d.artist.pid ? "" : "none";
     $("#detail-actions").innerHTML = "";
     $("#detail-tracks").innerHTML = mediaTable(
@@ -3597,7 +4442,7 @@ function albumRow(a) {
       <td class="tt">${esc(a.album || "—")}</td>
       <td class="artist">${esc(a.artist || "")}</td>
       <td class="num">${a.tracks || 0}</td>
-      <td class="actions"><span class="play">Play</span></td>
+      <td class="actions"><span class="play" title="Play"><i class="bi bi-play-fill"></i></span></td>
     </tr>`;
 }
 
@@ -3611,7 +4456,7 @@ async function showGenre(name) {
     $("#detail-title").textContent = name;
     $("#detail-sub").textContent =
         `${d.genre.albums} albums · ${d.genre.tracks} tracks`;
-    $("#btn-play-detail").textContent = "Play genre";
+    setPlayDetail("Play genre");
     $("#btn-play-detail").style.display = d.genre.tracks ? "" : "none";
     $("#detail-actions").innerHTML = "";
     $("#detail-tracks").innerHTML = mediaTable(
@@ -3634,7 +4479,7 @@ async function showAlbumArtist(name) {
     $("#detail-title").textContent = name;
     $("#detail-sub").textContent =
         `${d.album_artist.albums} albums · ${d.album_artist.tracks} tracks`;
-    $("#btn-play-detail").textContent = "Play album artist";
+    setPlayDetail("Play album artist");
     $("#btn-play-detail").style.display =
         d.album_artist.tracks ? "" : "none";
     $("#detail-actions").innerHTML = "";
@@ -3657,19 +4502,16 @@ async function showPlaylist(plId) {
     $("#detail-sub").textContent =
         `${d.playlist.tracks} tracks` +
         (d.playlist.missing ? ` · ${d.playlist.missing} missing` : "");
-    $("#btn-play-detail").textContent = "Play playlist";
+    setPlayDetail("Play localPlaylist");
     $("#btn-play-detail").style.display = d.items.length ? "" : "none";
-    $("#detail-actions").innerHTML = `
-        <button data-action="rename-playlist">Rename</button>
-        <button data-action="clear-playlist">Clear</button>
-        <button data-action="delete-playlist">Delete</button>`;
+    $("#detail-actions").innerHTML = "";
     $("#detail-tracks").innerHTML = mediaTable(
         TABLE_COLS.songs,
         d.items.map((t, i) => {
           const actions = `
-              <button class="icon-btn" data-move-up="1" title="Move up">Up</button>
-              <button class="icon-btn" data-move-down="1" title="Move down">Down</button>
-              <button class="icon-btn" data-remove="1" title="Remove">Remove</button>`;
+              <button class="icon-btn" data-move-up="1" title="Move up"><i class="bi bi-arrow-up"></i></button>
+              <button class="icon-btn" data-move-down="1" title="Move down"><i class="bi bi-arrow-down"></i></button>
+              <button class="icon-btn" data-remove="1" title="Remove"><i class="bi bi-dash-lg"></i></button>`;
           return trackRow(t, i + 1, actions);
         }),
         "Playlist is empty");
@@ -3691,7 +4533,7 @@ async function showDevicePlaylist(id) {
     $("#detail-title").textContent = d.playlist.name || "Device playlist";
     $("#detail-sub").textContent =
         `${d.playlist.tracks} tracks · Managed by iPod`;
-    $("#btn-play-detail").textContent = "Play device playlist";
+    setPlayDetail("Play device playlist");
     $("#btn-play-detail").style.display = d.items.length ? "" : "none";
     $("#detail-actions").innerHTML = "";
     $("#detail-tracks").innerHTML = mediaTable(
@@ -3725,54 +4567,19 @@ async function playPlaylist(plId, startIndex) {
   }
 }
 
-function openAddModal(ids, title) {
-  pendingAddItem = {ids: ids, title: title || ""};
-  $("#pl-modal-title").textContent = title
-      ? `Add to playlist: ${title}` : "Add to playlist";
-  $("#pl-modal-new").value = "";
-  $("#pl-modal-list").innerHTML = '<div class="modal-item">Loading…</div>';
-  $("#pl-modal").classList.add("show");
-  apiJson("/api/playlists", {cache: "no-store"}).then(d => {
-    const rows = (d.playlists || []).map(p => `
-      <div class="modal-item" data-id="${esc(p.id)}">
-        <span>${esc(p.name)}</span><span class="n">${p.tracks} tracks</span>
-      </div>`);
-    $("#pl-modal-list").innerHTML = rows.join("") ||
-        '<div class="modal-item">No playlists yet. Create one below.</div>';
-  }).catch(() => {
-    $("#pl-modal-list").innerHTML =
-        '<div class="modal-item">Playlist load failed</div>';
-  });
-}
-
-async function addPendingToPlaylist(plId) {
-  if (!pendingAddItem) return;
+async function openAddModal(ids, title) {
   try {
-    const j = await postJson(
-        `/api/playlists/${encodeURIComponent(plId)}/add`,
-        {item_ids: pendingAddItem.ids});
+    const j = await postJson("/api/playlists/localPlaylist/add",
+                             {item_ids: ids});
     if (!j.ok) { toast(j.error || "Add failed"); return; }
     const parts = [];
     if (j.added) parts.push(`Added ${j.added} tracks`);
     if (j.already) parts.push(`${j.already} already present`);
     if (j.missing) parts.push(`${j.missing} missing`);
-    toast(parts.join(", ") || "Done");
-    $("#pl-modal").classList.remove("show");
-    if (activeTab === "playlists") loadPlaylists();
+    toast(parts.join(", ") || "Added to localPlaylist");
+    if (activeTab === "localPlaylist") loadLocalPlaylist();
   } catch (e) {
     toast("Add failed");
-  }
-}
-
-async function createPlaylistAndAdd(name) {
-  name = (name || "").trim();
-  if (!name) { toast("Enter a playlist name"); return; }
-  try {
-    const c = await postJson("/api/playlists", {name: name});
-    if (!c.ok) { toast(c.error || "Create failed"); return; }
-    await addPendingToPlaylist(c.playlist.id);
-  } catch (e) {
-    toast("Create failed");
   }
 }
 
@@ -3791,6 +4598,7 @@ $("#lib-search").oninput = () => {
     else if (activeTab === "genres") loadGenres(true);
     else if (activeTab === "songs") loadSongs(true);
     else if (activeTab === "recent") loadRecent(true);
+    else if (activeTab === "localPlaylist") loadLocalPlaylist();
     else loadPlaylists();
   }, 250);
 };
@@ -3888,6 +4696,32 @@ $("#lib-playlists").onclick = (ev) => {
   if (dev) { showDevicePlaylist(dev.dataset.devicePlaylistId); return; }
   const el = ev.target.closest(".album[data-playlist-id]");
   if (el) showPlaylist(el.dataset.playlistId);
+};
+
+$("#lib-localPlaylist").onclick = async (ev) => {
+  const row = ev.target.closest(".track[data-id]");
+  if (!row) return;
+  if (ev.target.closest("[data-remove]")) {
+    ev.stopPropagation();
+    try {
+      const j = await postJson("/api/playlists/localPlaylist/remove",
+                               {item_id: row.dataset.id});
+      toast(j.ok ? "Removed" : (j.error || "Remove failed"));
+      loadLocalPlaylist();
+    } catch (e) { toast("Remove failed"); }
+    return;
+  }
+  playItem(row.dataset.id);
+};
+
+$("#btn-play-localPlaylist").onclick = async () => {
+  try {
+    const j = await postJson("/api/playlists/localPlaylist/play",
+                             {start_index: 0});
+    toast(j.ok ? `Playing ${j.played} tracks`
+               : (j.error || "Playback failed"));
+    setTimeout(poll, 500);
+  } catch (e) { toast("Playback failed"); }
 };
 
 $("#detail-tracks").onclick = async (ev) => {
@@ -4045,21 +4879,6 @@ $("#btn-play-detail").onclick = async () => {
 
 $("#btn-detail-close").onclick = hideDetail;
 
-$("#pl-modal-list").onclick = (ev) => {
-  const el = ev.target.closest(".modal-item[data-id]");
-  if (el) addPendingToPlaylist(el.dataset.id);
-};
-
-$("#pl-modal-create").onclick =
-    () => createPlaylistAndAdd($("#pl-modal-new").value);
-
-$("#pl-modal-close").onclick =
-    () => $("#pl-modal").classList.remove("show");
-
-$("#pl-modal").onclick = (ev) => {
-  if (ev.target.id === "pl-modal") $("#pl-modal").classList.remove("show");
-};
-
 $("#btn-resync").onclick = async () => {
   if (!confirm("Clear the local media mirror and resync from iPod?")) return;
   try {
@@ -4068,6 +4887,143 @@ $("#btn-resync").onclick = async () => {
     setTimeout(pollLibrary, 1500);
   } catch (e) {
     toast("Resync request failed");
+  }
+};
+
+async function mediaAction(action) {
+  try {
+    const j = await postJson("/api/media/action", {action});
+    if (!j.ok) {
+      toast(j.error || "MediaLibrary request failed");
+      return;
+    }
+    toast(action === "pair" ? "Pairing…" :
+          (action === "clear" ? "Clearing local cache…" :
+           "MediaLibrary task started"));
+    if (j.media) {
+      renderMedia(j.media, j.settings || (state && state.settings) || {});
+    }
+    setTimeout(poll, 400);
+  } catch (e) {
+    toast("MediaLibrary request failed");
+  }
+}
+
+async function mediaLoad(target) {
+  try {
+    const j = await postJson("/api/media/load", {target});
+    const any = j.ok && Object.values(j.loaded || {}).some(Boolean);
+    toast(j.ok ? (any ? "Cache loaded" : "No cache file to load")
+               : (j.error || "Load failed"));
+    setTimeout(poll, 300);
+  } catch (e) {
+    toast("Load failed");
+  }
+}
+
+$("#btn-media").onclick = () => {
+  renderMedia((state && state.media) || {},
+              (state && state.settings) || {});
+  $("#media-modal").classList.add("show");
+};
+$("#media-close").onclick =
+    () => $("#media-modal").classList.remove("show");
+$("#media-modal").onclick = (ev) => {
+  if (ev.target.id === "media-modal") {
+    $("#media-modal").classList.remove("show");
+  }
+};
+$("#media-pair").onclick = () => mediaAction("pair");
+$("#media-quick").onclick = () => mediaAction("quick");
+$("#media-full").onclick = () => {
+  if (confirm("Full Refresh deletes the local artwork cache and " +
+              "downloads every cover again. Continue?")) {
+    mediaAction("full");
+  }
+};
+$("#media-load-library").onclick = () => mediaLoad("library");
+$("#media-update-library").onclick = () => mediaAction("db");
+$("#media-load-artwork").onclick = () => mediaLoad("artwork");
+$("#media-update-artwork").onclick = () => mediaAction("artwork");
+$("#media-clear").onclick = () => {
+  if (confirm("Clear this device's AFC cache: MediaLibrary database " +
+              "snapshot, dates/artwork SQLite cache, and library artwork? " +
+              "The iAP2 library and artwork caches are kept.")) {
+    mediaAction("clear");
+  }
+};
+$("#media-cancel").onclick = async () => {
+  try {
+    const j = await postJson("/api/media/cancel", {});
+    toast(j.ok ? "Cancelling…" : (j.error || "Cancel failed"));
+    setTimeout(poll, 300);
+  } catch (e) {
+    toast("Cancel failed");
+  }
+};
+$("#media-switch-iap2").onclick = async () => {
+  try {
+    const j = await postJson("/api/media/mode", {mode: "iap2"});
+    toast(j.ok ? "Switching to iAP2…" : (j.error || "Switch failed"));
+    setTimeout(poll, 300);
+  } catch (e) {
+    toast("Switch failed");
+  }
+};
+$("#iap2-sync").onclick = async () => {
+  try {
+    const j = await postJson("/api/library/sync-incremental", {});
+    toast(j.ok ? "Incremental sync requested" : (j.error || "Sync failed"));
+  } catch (e) {
+
+
+    toast("Sync failed");
+  }
+};
+$("#iap2-resync").onclick = async () => {
+  if (!confirm("Clear the iAP2 revision and request a full media-library " +
+               "sync?")) return;
+  try {
+    const j = await postJson("/api/library/sync", {});
+    toast(j.ok ? "Full resync requested" : (j.error || "Resync failed"));
+    setTimeout(poll, 500);
+  } catch (e) {
+    toast("Resync failed");
+  }
+};
+$("#iap2-clear-library").onclick = async () => {
+  if (!confirm("Clear the iAP2 media-library mirror for the active device? " +
+               "The protocol will perform a full resync.")) return;
+  try {
+    const j = await postJson("/api/library/clear-iap2", {});
+    toast(j.ok ? "iAP2 library cleared; resyncing"
+               : (j.error || "Clear failed"));
+    setTimeout(poll, 500);
+    setTimeout(pollLibrary, 1500);
+  } catch (e) {
+    toast("Clear failed");
+  }
+};
+$("#iap2-clear-artwork").onclick = async () => {
+  if (!confirm("Clear the iAP2 Now Playing artwork cache for this device?"))
+    return;
+  try {
+    const j = await postJson("/api/library/clear-artwork", {});
+    toast(j.ok ? "iAP2 artwork cache cleared" : (j.error || "Clear failed"));
+    setTimeout(poll, 300);
+  } catch (e) {
+    toast("Clear failed");
+  }
+};
+$("#media-auto-iap2").onchange = async () => {
+  const value = $("#media-auto-iap2").checked;
+  try {
+    const j = await postJson("/api/settings", {auto_switch_iap2: value});
+    toast(j.ok ? (value ? "Auto switch enabled" : "Auto switch disabled")
+               : (j.error || "Setting save failed"));
+    setTimeout(poll, 200);
+  } catch (e) {
+    toast("Setting save failed");
   }
 };
 
@@ -4104,6 +5060,26 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
             self._send(200, INDEX_HTML.encode(), "text/html; charset=utf-8")
+        elif path.startswith("/static/"):
+            root = os.path.abspath(os.path.join(BASE_DIR, "static"))
+            rel = path[len("/static/"):]
+            full = os.path.abspath(os.path.join(root, rel))
+            if (not full.startswith(root + os.sep)
+                    or not os.path.isfile(full)):
+                self._json({"error": "not found"}, 404)
+                return
+            mime = mimetypes.guess_type(full)[0] or "application/octet-stream"
+            if full.endswith(".woff2"):
+                mime = "font/woff2"
+            elif full.endswith(".woff"):
+                mime = "font/woff"
+            try:
+                with open(full, "rb") as fh:
+                    blob = fh.read()
+            except OSError:
+                self._json({"error": "not found"}, 404)
+                return
+            self._send(200, blob, mime)
         elif path == "/api/state":
             self._json(snapshot())
         elif path == "/api/library":
@@ -4197,7 +5173,6 @@ class Handler(BaseHTTPRequestHandler):
             pl_id = path.rstrip("/").split("/")[-1]
             self._json(playlist_get(pl_id))
         elif path == "/api/library/artwork":
-            load_media_artwork()
             qs = parse_qs(urlparse(self.path).query)
             pid = (qs.get("pid") or [None])[0]
             album_pid = (qs.get("album_pid") or [None])[0]
@@ -4214,7 +5189,7 @@ class Handler(BaseHTTPRequestHandler):
             if not rel:
                 rel = entry.get("file")
             full = os.path.abspath(os.path.join(BASE_DIR, rel or ""))
-            root = os.path.abspath(MEDIA_ARTWORK_DIR)
+            root = os.path.abspath(_artwork_dir())
             if not (full == root or full.startswith(root + os.sep)):
                 self._json({"error": "invalid artwork path"}, 404)
                 return
@@ -4259,6 +5234,72 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/library/sync":
                 SESSION.resync_library()
                 self._json({"ok": True, "message": "resync requested"})
+            elif path == "/api/library/sync-incremental":
+                SESSION.sync_library_incremental()
+                self._json({"ok": True, "message": "incremental sync requested"})
+            elif path == "/api/library/clear-iap2":
+                if MEDIA_JOBS.busy():
+                    self._json({"ok": False,
+                                "error": "Cancel the running task first"},
+                               409)
+                    return
+                self._json({"ok": True, "stats": clear_iap2_library()})
+            elif path == "/api/library/clear-artwork":
+                if MEDIA_JOBS.busy():
+                    self._json({"ok": False,
+                                "error": "Cancel the running task first"},
+                               409)
+                    return
+                self._json({"ok": True, "stats": clear_iap2_artwork()})
+            elif path == "/api/media/action":
+                ok, error = MEDIA_JOBS.start(
+                    str(payload.get("action") or ""))
+                if not ok:
+                    self._json({"ok": False, "error": error}, 409)
+                    return
+                media = MEDIA_JOBS.snapshot()
+                media["cache"] = media_cache_state()
+                self._json({"ok": True, "media": media,
+                            "settings": settings_snapshot()})
+            elif path == "/api/media/cancel":
+                ok, error = MEDIA_JOBS.cancel()
+                if not ok:
+                    self._json({"ok": False, "error": error}, 409)
+                    return
+                self._json({"ok": True, "media": MEDIA_JOBS.snapshot()})
+            elif path == "/api/media/mode":
+                if payload.get("mode") != "iap2":
+                    self._json({"ok": False,
+                                "error": "mode must be iap2"}, 400)
+                    return
+                ok, error = MEDIA_JOBS.request_iap2()
+                if not ok:
+                    self._json({"ok": False, "error": error}, 409)
+                    return
+                self._json({"ok": True, "media": MEDIA_JOBS.snapshot()})
+            elif path == "/api/media/load":
+                if MEDIA_JOBS.busy():
+                    self._json({"ok": False,
+                                "error": "Cancel the running task first"},
+                               409)
+                    return
+                target = str(payload.get("target") or "all")
+                if target not in ("library", "artwork", "all"):
+                    self._json({"ok": False, "error": "invalid target"}, 400)
+                    return
+                loaded = load_media_cache(target)
+                self._json({"ok": True, "loaded": loaded,
+                            "cache": media_cache_state()})
+            elif path == "/api/settings":
+                if not isinstance(payload.get("auto_switch_iap2"), bool):
+                    self._json({"ok": False,
+                                "error": "auto_switch_iap2 must be boolean"},
+                               400)
+                    return
+                with SETTINGS_LOCK:
+                    SETTINGS["auto_switch_iap2"] = payload["auto_switch_iap2"]
+                save_settings()
+                self._json({"ok": True, "settings": settings_snapshot()})
             elif path == "/api/play":
                 item_id = payload.get("item_id")
                 album_pid = payload.get("album_pid")
@@ -4371,17 +5412,33 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": False, "error": "not found"}, 404)
         except KeyError as exc:
             self._json({"ok": False, "error": str(exc)}, 404)
+        except ValueError as exc:
+            self._json({"ok": False, "error": str(exc)}, 400)
         except Exception as exc:  # noqa: BLE001
             self._json({"ok": False, "error": str(exc)}, 500)
 
 
 def main():
     print(f"MediaCtrl web UI on http://0.0.0.0:{PORT}/")
+    device_store.load_registry()
+    load_settings()
     load_library()
-    load_media_dates()
-    load_media_artwork()
     load_playlists()
-    load_history()
+    cache_path = _media_cache_path()
+    if (os.path.exists(cache_path)
+            or (not _library_id()
+                and (os.path.exists(MEDIA_DATES_PATH)
+                     or os.path.exists(MEDIA_ARTWORK_PATH)))):
+        try:
+            media_cache.ensure_cache(
+                cache_path,
+                legacy_dates_path=(MEDIA_DATES_PATH
+                                   if not _library_id() else None),
+                legacy_artwork_path=(MEDIA_ARTWORK_PATH
+                                     if not _library_id() else None),
+                base_dir=BASE_DIR)
+        except Exception as exc:  # noqa: BLE001
+            print(f"media cache initialization failed: {exc}")
     SESSION.start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     server.daemon_threads = True

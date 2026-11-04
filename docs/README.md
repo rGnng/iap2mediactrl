@@ -11,7 +11,8 @@
 The Apple Accessory Interface Specification PDF is local reference material.
 It is not distributed with this repository.
 
-Runtime data stays at the repository root (`media-library.json`, `media-db-*.json`,
-`media-artwork/`, caches). The raw SQLite snapshot, development logs, captures and
-early probe scripts are under `artifacts/`. Both the runtime data and the
-development artifacts are excluded from Git.
+Runtime data is stored per device under `data/<library_id>/` (`iap2.db`,
+`media-cache.db`, `media-artwork/`, `artwork-cache/`, `localPlaylist.csv`,
+`history.log`). Development logs, captures, and early probe scripts are under
+`artifacts/`. Both runtime data and development artifacts are excluded from
+Git.

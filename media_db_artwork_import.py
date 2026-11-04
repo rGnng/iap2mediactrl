@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Export artwork referenced by MediaLibrary.sqlitedb through AFC/ifuse.
+"""Export artwork referenced by MediaLibrary.sqlitedb through AFC.
 
-Separate from the iAP2/HID service.  It writes:
-  media-artwork/<sha1>.<ext>   image files
-  media-db-artwork.json        item/album -> local artwork mapping
+The canonical output is the shared SQLite cache (`media-cache.db`) plus the
+content-addressed image files.  An optional JSON export is available for
+debugging.
 """
 from __future__ import annotations
 
@@ -11,70 +11,33 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
-import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
-APPLE_EPOCH = 978307200
-DEFAULT_DB = "artifacts/media-db-snapshot/media-db-backup.sqlitedb"
+import media_cache
+from media_db_import import (
+    BASE_DIR,
+    SNAPSHOT_NAME,
+    ensure_paired,
+    find_device,
+    find_media_db,
+    mount_afc,
+    progress_line,
+    read_library_uuid,
+    snapshot_db,
+    snapshot_db_afc,
+    unmount_afc,
+)
 
-
-def run(cmd, timeout=30):
-    print("+ " + " ".join(str(x) for x in cmd), flush=True)
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if p.stdout.strip():
-        print(p.stdout.strip(), flush=True)
-    if p.stderr.strip():
-        print(p.stderr.strip(), file=sys.stderr, flush=True)
-    return p
-
-
-def find_device():
-    p = run(["idevice_id", "-l"], timeout=10)
-    ids = [x.strip() for x in p.stdout.splitlines() if x.strip()]
-    return ids[0] if ids else None
-
-
-def ensure_paired(udid=None):
-    cmd = ["idevicepair"]
-    if udid:
-        cmd += ["-u", udid]
-    cmd += ["validate"]
-    p = run(cmd, timeout=10)
-    if p.returncode == 0:
-        return True
-    print("Device is not paired; accept the Trust dialog on the iPod.",
-          file=sys.stderr)
-    return False
-
-
-def mount_afc(udid=None):
-    mnt = Path(tempfile.mkdtemp(prefix="ipod-afc-"))
-    cmd = ["ifuse", str(mnt)]
-    if udid:
-        cmd[1:1] = ["--udid", udid]
-    p = run(cmd, timeout=30)
-    if p.returncode != 0:
-        shutil.rmtree(mnt, ignore_errors=True)
-        raise RuntimeError("ifuse mount failed")
-    return mnt
-
-
-def unmount_afc(mnt: Path):
-    for cmd in (["fusermount3", "-u", str(mnt)], ["umount", str(mnt)]):
-        try:
-            if run(cmd, timeout=15).returncode == 0:
-                break
-        except Exception:
-            pass
-    try:
-        mnt.rmdir()
-    except OSError:
-        pass
+SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
+DEFAULT_ARTWORK_DIR = BASE_DIR / "media-artwork"
+DEFAULT_CACHE_DB = BASE_DIR / "media-cache.db"
+DEFAULT_SNAPSHOT_DIR = BASE_DIR / "artifacts" / "media-db-snapshot"
+DEFAULT_DB = DEFAULT_SNAPSHOT_DIR / SNAPSHOT_NAME
 
 
 def image_kind(path: Path):
@@ -97,9 +60,9 @@ def image_kind(path: Path):
 
 
 def read_mapping(db: Path):
+    """Read item/album artwork references from the device database."""
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
-    # Direct item-level artwork.
     rows = list(conn.execute(
         """SELECT b.entity_pid AS pid, b.available_artwork_token AS token,
                   a.relative_path AS rel, b.artwork_type AS atype
@@ -144,179 +107,410 @@ def read_mapping(db: Path):
     return item_art, album_art, items, albums, conn
 
 
+def sha1_rel(rel: str) -> str:
+    return hashlib.sha1(rel.encode("utf-8")).hexdigest()
+
+
+def pid_hex(value) -> str:
+    # MediaLibrary stores signed 64-bit PIDs; iAP2 uses unsigned hex.
+    return f"{int(value) & 0xffffffffffffffff:016x}"
+
+
+def local_path(path_text):
+    if not path_text:
+        return None
+    path = Path(path_text)
+    return path if path.is_absolute() else BASE_DIR / path
+
+
+def public_path(path: Path) -> str:
+    try:
+        return os.path.relpath(str(path), str(BASE_DIR))
+    except ValueError:
+        return str(path)
+
+
+def usable_file(path_text) -> Path | None:
+    path = local_path(path_text)
+    if path is None:
+        return None
+    try:
+        if path.is_file() and path.stat().st_size > 0:
+            return path
+    except OSError:
+        return None
+    return None
+
+
+def existing_artwork(artwork_dir: Path):
+    """Map SHA1 -> existing top-level artwork file."""
+    found = {}
+    if not artwork_dir.is_dir():
+        return found
+    for path in artwork_dir.iterdir():
+        if not path.is_file():
+            continue
+        stem = path.stem.lower()
+        if SHA1_RE.match(stem):
+            found[stem] = path
+    return found
+
+
+def make_thumb(src: Path, thumb: Path) -> bool:
+    if thumb.exists() and thumb.stat().st_size > 0:
+        return True
+    try:
+        from PIL import Image, ImageOps
+        with Image.open(src) as im:
+            im = ImageOps.exif_transpose(im)
+            im.thumbnail((160, 160))
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            im.save(thumb, "JPEG", quality=82, optimize=True)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"thumbnail {src}: {exc}", file=sys.stderr, flush=True)
+        return False
+
+
+def file_record(sha: str, rel: str, path: Path, thumb: Path | None,
+                mime: str):
+    thumb_bytes = 0
+    if thumb is not None and thumb.exists():
+        try:
+            thumb_bytes = thumb.stat().st_size
+        except OSError:
+            thumb = None
+    return {
+        "sha1": sha,
+        "rel": rel,
+        "file": public_path(path),
+        "thumb": public_path(thumb) if thumb is not None else None,
+        "mime": mime,
+        "bytes": path.stat().st_size if path.exists() else 0,
+        "thumb_bytes": thumb_bytes,
+        "updated_at": time.time(),
+    }
+
+
+def wipe_artwork(artwork_dir: Path):
+    """Delete all local artwork files for a full refresh."""
+    if not artwork_dir.is_dir():
+        return 0
+    removed = 0
+    for child in list(artwork_dir.iterdir()):
+        try:
+            if child.is_dir():
+                removed += sum(1 for path in child.rglob("*")
+                               if path.is_file())
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+                removed += 1
+        except OSError as exc:
+            print(f"delete {child}: {exc}", file=sys.stderr, flush=True)
+    return removed
+
+
+def garbage_collect(artwork_dir: Path, referenced: set[str]):
+    """Remove cached files that are no longer referenced."""
+    removed = 0
+    for folder in (artwork_dir, artwork_dir / "thumbs"):
+        if not folder.is_dir():
+            continue
+        for path in list(folder.iterdir()):
+            if not path.is_file():
+                continue
+            stem = path.stem.lower()
+            stale_sha = SHA1_RE.match(stem) and stem not in referenced
+            if stale_sha or path.suffix == ".tmp":
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--db", type=Path, default=Path(DEFAULT_DB))
+    ap.add_argument("--db", type=Path, default=None,
+                    help="MediaLibrary snapshot (default: refresh from device)")
     ap.add_argument("--mount", action="store_true")
     ap.add_argument("--udid")
     ap.add_argument("--artwork-root", type=Path,
                     help="already mounted iTunes_Control/Artwork directory")
-    ap.add_argument("--artwork-dir", type=Path, default=Path("media-artwork"))
-    ap.add_argument("--out", type=Path, default=Path("media-db-artwork.json"))
+    ap.add_argument("--artwork-dir", type=Path, default=DEFAULT_ARTWORK_DIR)
+    ap.add_argument("--cache-db", type=Path, default=DEFAULT_CACHE_DB)
+    ap.add_argument("--snapshot-dir", type=Path, default=DEFAULT_SNAPSHOT_DIR)
+    ap.add_argument("--mode", choices=("quick", "full"), default="quick",
+                    help="quick reuses existing files; full deletes and recopies")
+    ap.add_argument("--force", action="store_true",
+                    help="legacy alias for --mode full")
     ap.add_argument("--limit", type=int, default=0,
                     help="limit unique files (testing)")
-    ap.add_argument("--force", action="store_true",
-                    help="re-copy existing artwork files")
+    ap.add_argument("--progress-json", action="store_true")
+    ap.add_argument("--out", type=Path, default=None,
+                    help="optional legacy JSON export")
     args = ap.parse_args()
+    if args.force:
+        args.mode = "full"
+
+    def progress(**fields):
+        progress_line(args.progress_json, **fields)
 
     started = time.monotonic()
     mnt = None
-    mount_seconds = 0.0
+    conn = None
     root = args.artwork_root
+    db = args.db
     try:
         if args.mount:
+            progress(stage="wait_usbmuxd", message="Looking for iOS device")
             udid = args.udid or find_device()
             if not udid:
                 raise RuntimeError("no iOS device found (is usbmuxd running?)")
+            progress(stage="pair_check", message="Checking pairing",
+                     udid=udid)
             if not ensure_paired(udid):
+                progress(stage="pair_required",
+                         message="Device is not paired; run Pair / Trust")
                 return 2
-            t = time.monotonic()
+            progress(stage="mount", message="Mounting AFC")
             mnt = mount_afc(udid)
-            mount_seconds = time.monotonic() - t
             root = mnt / "iTunes_Control" / "iTunes" / "Artwork" / "Originals"
+            if db is None:
+                progress(stage="db_find",
+                         message="Locating MediaLibrary database")
+                found = find_media_db(mnt)
+                if not found:
+                    raise RuntimeError("MediaLibrary.sqlitedb not found on mount")
+                remote = "/" + str(found.relative_to(mnt))
+                if shutil.which("afcclient"):
+                    try:
+                        db = snapshot_db_afc(
+                            udid, remote, args.snapshot_dir,
+                            progress=progress)
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"AFC snapshot failed ({exc}); using ifuse "
+                              f"fallback", flush=True)
+                        db = snapshot_db(
+                            found, args.snapshot_dir, progress=progress)
+                else:
+                    db = snapshot_db(
+                        found, args.snapshot_dir, progress=progress)
+        if db is None:
+            db = DEFAULT_DB
         if root is None:
             raise RuntimeError("use --mount or --artwork-root")
         if not root.is_dir():
             raise RuntimeError(f"artwork directory not found: {root}")
-        if not args.db.exists():
-            raise RuntimeError(f"database not found: {args.db}")
+        if not db.exists():
+            raise RuntimeError(f"database not found: {db}")
+        library_id = read_library_uuid(db)
 
+        progress(stage="artwork_scan", message="Reading artwork mapping",
+                 stats={"library_id": library_id})
         t = time.monotonic()
-        item_art, album_art, items, albums, conn = read_mapping(args.db)
-        conn.close()
+        item_art, album_art, items, albums, db_conn = read_mapping(db)
+        db_conn.close()
         db_seconds = time.monotonic() - t
 
         args.artwork_dir.mkdir(parents=True, exist_ok=True)
         thumb_dir = args.artwork_dir / "thumbs"
         thumb_dir.mkdir(parents=True, exist_ok=True)
-        # Unique source paths, preserving art for item and album maps.
+        media_cache.ensure_cache(
+            args.cache_db,
+            legacy_dates_path=BASE_DIR / "media-db-dates.json",
+            legacy_artwork_path=BASE_DIR / "media-db-artwork.json",
+            base_dir=str(BASE_DIR))
+        conn = media_cache.open_db(args.cache_db)
+        old_files = media_cache.load_file_records(conn)
+
         rels = sorted({v["rel"] for v in item_art.values()} |
                       {v["rel"] for v in album_art.values()})
         if args.limit:
             rels = rels[:args.limit]
-        rel_to_file = {}
-        copied = skipped = failed = 0
-        total_bytes = 0
-        thumb_bytes = 0
+
+        deleted = 0
+        if args.mode == "full":
+            progress(stage="artwork_wipe",
+                     message="Deleting local artwork cache")
+            deleted = wipe_artwork(args.artwork_dir)
+            thumb_dir.mkdir(parents=True, exist_ok=True)
+        existing = existing_artwork(args.artwork_dir)
+
+        files = {}
+        need_copy = []
+        reused = 0
         thumbs = 0
+        for rel in rels:
+            sha = sha1_rel(rel)
+            record = old_files.get(sha)
+            path = usable_file(record["file"]) if record else None
+            if path is None:
+                path = usable_file(existing.get(sha))
+            if path is not None:
+                thumb = thumb_dir / f"{sha}.jpg"
+                had_thumb = thumb.exists()
+                made_thumb = make_thumb(path, thumb)
+                if made_thumb and not had_thumb:
+                    thumbs += 1
+                mime = record.get("mime") if record else \
+                    image_kind(path)[1]
+                # Reuse the original even when the device file is truncated
+                # and a thumbnail cannot be generated; the web API falls back
+                # to the original image in that case.
+                files[sha] = file_record(
+                    sha, rel, path, thumb if made_thumb else None, mime)
+                reused += 1
+                continue
+            need_copy.append(rel)
+
+        copy_bytes_total = 0
+        for rel in need_copy:
+            try:
+                copy_bytes_total += (root / rel).stat().st_size
+            except OSError:
+                pass
+        progress(stage="artwork_scan", done=0, total=len(rels),
+                 unit="files",
+                 message=f"{len(need_copy)} new artwork files",
+                 stats={
+                     "required_files": len(rels),
+                     "reused_files": reused,
+                     "copy_files": len(need_copy),
+                     "deleted_files": deleted,
+                 })
+
+        copied = failed = 0
+        bytes_copied = 0
         copy_seconds = 0.0
         t = time.monotonic()
-        for i, rel in enumerate(rels, 1):
+        for done, rel in enumerate(need_copy, 1):
             src = root / rel
             if not src.is_file():
                 failed += 1
                 print(f"missing artwork {rel}", file=sys.stderr, flush=True)
-                continue
-            try:
-                sha = hashlib.sha1(rel.encode("utf-8")).hexdigest()
-                # Detect extension before the final name.
-                tmp = args.artwork_dir / (sha + ".tmp")
-                with src.open("rb") as fsrc, tmp.open("wb") as fdst:
-                    shutil.copyfileobj(fsrc, fdst, 1024 * 1024)
-                ext, mime = image_kind(tmp)
-                dst = args.artwork_dir / f"{sha}.{ext}"
-                if dst.exists() and not args.force:
-                    tmp.unlink(missing_ok=True)
-                    skipped += 1
-                else:
+            else:
+                try:
+                    sha = sha1_rel(rel)
+                    tmp = args.artwork_dir / (sha + ".tmp")
+                    shutil.copyfile(src, tmp)
+                    ext, mime = image_kind(tmp)
+                    dst = args.artwork_dir / f"{sha}.{ext}"
                     os.replace(tmp, dst)
                     copied += 1
-                    total_bytes += dst.stat().st_size
-                thumb = thumb_dir / f"{sha}.jpg"
-                if not thumb.exists():
-                    try:
-                        from PIL import Image, ImageOps
-                        with Image.open(dst) as im:
-                            im = ImageOps.exif_transpose(im)
-                            im.thumbnail((160, 160))
-                            if im.mode not in ("RGB", "L"):
-                                im = im.convert("RGB")
-                            im.save(thumb, "JPEG", quality=82, optimize=True)
+                    bytes_copied += dst.stat().st_size
+                    thumb = thumb_dir / f"{sha}.jpg"
+                    had_thumb = thumb.exists()
+                    if make_thumb(dst, thumb) and not had_thumb:
                         thumbs += 1
-                        thumb_bytes += thumb.stat().st_size
-                    except Exception as exc:
-                        print(f"thumbnail {rel}: {exc}", file=sys.stderr,
-                              flush=True)
-                rel_to_file[rel] = {
-                    "file": f"{args.artwork_dir.name}/{dst.name}",
-                    "thumb": (f"{args.artwork_dir.name}/thumbs/{thumb.name}"
-                              if thumb.exists() else None),
-                    "mime": mime,
-                }
-                if i % 250 == 0:
-                    print(f"  artwork {i}/{len(rels)}", flush=True)
-            except Exception as exc:
-                failed += 1
-                print(f"artwork {rel}: {exc}", file=sys.stderr, flush=True)
+                    files[sha] = file_record(sha, rel, dst, thumb, mime)
+                except Exception as exc:  # noqa: BLE001
+                    failed += 1
+                    print(f"artwork {rel}: {exc}", file=sys.stderr, flush=True)
+            if done % 5 == 0 or done == len(need_copy):
+                progress(stage="artwork_copy", done=done,
+                         total=len(need_copy), unit="files",
+                         bytes_done=bytes_copied,
+                         bytes_total=copy_bytes_total,
+                         stats={
+                             "required_files": len(rels),
+                             "reused_files": reused,
+                             "copy_files": len(need_copy),
+                             "copied": copied,
+                             "failed": failed,
+                             "thumbs": thumbs,
+                         })
         copy_seconds = time.monotonic() - t
 
-        def public(entry):
-            if not entry:
-                return None
-            f = rel_to_file.get(entry["rel"])
-            if not f:
-                return None
-            return {
-                "token": entry["token"],
-                "file": f["file"],
-                "thumb": f.get("thumb"),
-                "mime": f["mime"],
-                "fallback": entry.get("fallback", False),
-            }
+        def mapping(source):
+            out = {}
+            for pid, entry in source.items():
+                sha = sha1_rel(entry["rel"])
+                if sha not in files:
+                    continue
+                out[pid_hex(pid)] = {
+                    "token": entry.get("token"),
+                    "sha1": sha,
+                    "fallback": bool(entry.get("fallback")),
+                }
+            return out
 
-        def pid_hex(value):
-            # MediaLibrary stores signed 64-bit PIDs; iAP2 uses unsigned hex.
-            return f"{int(value) & 0xffffffffffffffff:016x}"
-
-        item_out = {}
-        for pid, entry in item_art.items():
-            pub = public(entry)
-            if pub:
-                item_out[pid_hex(pid)] = pub
-        album_out = {}
-        for ap, entry in album_art.items():
-            pub = public(entry)
-            if pub:
-                album_out[pid_hex(ap)] = pub
-        elapsed = time.monotonic() - started
-        result = {
-            "ok": True,
-            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "source": {
-                "database": str(args.db),
+        item_out = mapping(item_art)
+        album_out = mapping(album_art)
+        progress(stage="cache_write", message="Updating SQLite cache",
+                 stats={"items": len(item_out), "albums": len(album_out),
+                        "files": len(files)})
+        cache_stats = media_cache.replace_artwork(
+            conn, item_out, album_out, files,
+            source={
+                "database": str(db),
+                "library_id": library_id,
                 "artwork_root": str(root),
                 "artwork_dir": str(args.artwork_dir),
-            },
-            "stats": {
-                "db_items": len(items),
-                "db_albums": len(albums),
-                "item_art": len(item_out),
-                "album_art": len(album_out),
-                "unique_source_paths": len(rels),
-                "copied": copied,
-                "skipped": skipped,
-                "failed": failed,
-                "original_bytes": total_bytes,
-                "thumbnails": thumbs,
-                "thumb_bytes": thumb_bytes,
-                "bytes_copied": total_bytes + thumb_bytes,
-                "mount_seconds": round(mount_seconds, 3),
-                "db_seconds": round(db_seconds, 3),
-                "copy_seconds": round(copy_seconds, 3),
-                "total_seconds": round(elapsed, 3),
-            },
-            "items": item_out,
-            "albums": album_out,
+                "mode": args.mode,
+            })
+        removed = garbage_collect(args.artwork_dir, set(files))
+
+        elapsed = time.monotonic() - started
+        stats = {
+            "mode": args.mode,
+            "library_id": library_id,
+            "db_items": len(items),
+            "db_albums": len(albums),
+            "required_files": len(rels),
+            "copy_files": len(need_copy),
+            "reused_files": reused,
+            "copied": copied,
+            "failed": failed,
+            "thumbs": thumbs,
+            "deleted_files": deleted,
+            "removed_files": removed,
+            "bytes_copied": bytes_copied,
+            "new_items": cache_stats["items"]["new"],
+            "changed_items": cache_stats["items"]["updated"],
+            "removed_items": cache_stats["items"]["removed"],
+            "new_albums": cache_stats["albums"]["new"],
+            "new_files": cache_stats["files"]["new"],
+            "cache": cache_stats,
+            "db_seconds": round(db_seconds, 3),
+            "copy_seconds": round(copy_seconds, 3),
+            "total_seconds": round(elapsed, 3),
         }
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        tmp = args.out.with_suffix(args.out.suffix + ".tmp")
-        tmp.write_text(json.dumps(result, ensure_ascii=False, indent=2),
-                       encoding="utf-8")
-        os.replace(tmp, args.out)
-        print(json.dumps(result["stats"], ensure_ascii=False, indent=2))
-        print(f"wrote {args.out}", flush=True)
+        progress(stage="done", done=len(rels), total=len(rels),
+                 unit="files", message="Artwork cache updated",
+                 stats=stats)
+
+        if args.out:
+            exported_items, exported_albums = media_cache.load_artwork(conn)
+            result = {
+                "ok": True,
+                "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                              time.gmtime()),
+                "source": {
+                    "database": str(db),
+                    "artwork_root": str(root),
+                    "artwork_dir": str(args.artwork_dir),
+                },
+                "stats": stats,
+                "items": exported_items,
+                "albums": exported_albums,
+            }
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            tmp = args.out.with_suffix(args.out.suffix + ".tmp")
+            tmp.write_text(json.dumps(result, ensure_ascii=False, indent=2),
+                           encoding="utf-8")
+            os.replace(tmp, args.out)
+            print(f"wrote {args.out}", flush=True)
+
+        if not args.progress_json:
+            print(json.dumps(stats, ensure_ascii=False, indent=2), flush=True)
         return 0
     finally:
+        if conn is not None:
+            conn.close()
         if mnt is not None:
             unmount_afc(mnt)
 
@@ -324,6 +518,9 @@ def main():
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("cancelled", file=sys.stderr)
+        raise SystemExit(130)
     except Exception as exc:
         print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
         raise SystemExit(1)
