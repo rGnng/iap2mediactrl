@@ -109,7 +109,7 @@ local_uuid = [None]
 def identification_params():
     sent = [
         0xAA01, 0xAA03,
-        0x5000, 0x5002,
+        0x5000, 0x5002, 0x5003,
         0x4C00, 0x4C02, 0x4C03, 0x4C05, 0x4C06, 0x4C07, 0x4C08, 0x4C09,
         0x6800, 0x6802, 0x6803,
     ]
@@ -118,6 +118,7 @@ def identification_params():
         0x5001,
         0x4C01, 0x4C04,
         0x6801, 0x6804,
+        0x4E09, 0x4E0A, 0x4E0B, 0x4E0C,
     ]
     return [
         csm.string(0, "MediaCtrl"),
@@ -157,7 +158,7 @@ def now_playing_params():
             0,
             [csm.void(i) for i in
              (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
-              16, 18, 19, 26)],
+              16, 18, 19, 21, 22, 23, 24, 26, 27)],
         ),
         # PlaybackAttributes: status, elapsed, queue index/count/chapter,
         # shuffle mode, repeat mode, app name, and queue-list transfer size.
@@ -174,6 +175,22 @@ def now_playing_params():
             [csm.void(i) for i in (0, 1, 6, 12, 14, 16, 18)],
         ),
     ]
+
+
+async def send_now_playing_info(conn, elapsed_ms=None, queue_index=None):
+    """0x5003 SetNowPlayingInformation (seek / queue position).
+
+    The device only accepts this when it advertised SetElapsedTimeAvailable
+    in 0x5001, and the spec allows it only as a direct user action.
+    """
+    params = []
+    if elapsed_ms is not None:
+        params.append(csm.u32(0, max(0, min(int(elapsed_ms), 0xFFFFFFFF))))
+    if queue_index is not None:
+        params.append(csm.u32(1, max(0, min(int(queue_index), 0xFFFFFFFF))))
+    if not params:
+        raise ValueError("elapsed_ms or queue_index is required")
+    await send_csm(conn, 0x5003, params)
 
 
 def parse_string(payload):
@@ -314,8 +331,12 @@ def print_now_playing(body):
                     print(f"    artist={parse_string(child)!r}")
                 elif child_id == 4:
                     print(f"    duration_ms={parse_u32(child)}")
+                elif child_id in (21, 22, 23, 24) and child:
+                    print(f"    like/ban param {child_id}={bool(child[0])}")
                 elif child_id == 26:
                     print(f"    artwork_id={child[0] if child else None}")
+                elif child_id == 27:
+                    print(f"    chapter_count={parse_u32(child)}")
         elif pid == 1:
             print("  playback:")
             for child_id, child in csm.parse_params(payload):
@@ -325,6 +346,12 @@ def print_now_playing(body):
                     print(f"    elapsed_ms={parse_u32(child)}")
                 elif child_id == 7:
                     print(f"    app={parse_string(child)!r}")
+                elif child_id == 12:
+                    print(f"    playback_speed={parse_u32(child)}")
+                elif child_id == 13 and child:
+                    print(f"    seek_available={bool(child[0])}")
+                elif child_id == 16:
+                    print(f"    app_bundle_id={parse_string(child)!r}")
 
 
 async def send_csm(conn, msg_id, params):
@@ -392,6 +419,25 @@ async def handle_control(conn, mfi):
             print(f"  HID message 0x{msg_id:04x}")
             for pid, payload in csm.parse_params(body):
                 print(f"    param {pid}: {payload.hex(' ')}")
+        elif msg_id == 0xAE01:
+            print("  power update")
+            for pid, payload in csm.parse_params(body):
+                value = int.from_bytes(payload, "big") if payload else None
+                print(f"    param {pid}: {value}")
+        elif msg_id in (0x4E09, 0x4E0A, 0x4E0B, 0x4E0C):
+            print(f"  device notification 0x{msg_id:04x}")
+            for pid, payload in csm.parse_params(body):
+                if msg_id == 0x4E09 and pid == 0:
+                    print(f"    name={parse_string(payload)!r}")
+                elif msg_id == 0x4E0A and pid == 0:
+                    print(f"    language={parse_string(payload)!r}")
+                elif msg_id == 0x4E0B:
+                    print(f"    param {pid}: "
+                          f"{int.from_bytes(payload, 'big', signed=True)}")
+                elif msg_id == 0x4E0C and pid == 0:
+                    print(f"    uuid={parse_string(payload)!r}")
+                else:
+                    print(f"    param {pid}: {payload.hex(' ')}")
         elif msg_id == 0x4C01:
             print("  media library information")
             for lib in parse_library_info(body):

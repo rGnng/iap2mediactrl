@@ -26,6 +26,14 @@ def u16(pid, value):
     return param(pid, struct.pack(">H", value))
 
 
+def u32(pid, value):
+    return param(pid, struct.pack(">I", value))
+
+
+def u64(pid, value):
+    return param(pid, struct.pack(">Q", value))
+
+
 def u16_list(pid, values):
     return param(pid, b"".join(struct.pack(">H", value) for value in values))
 

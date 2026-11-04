@@ -27,8 +27,11 @@ library contained about 20,500 tracks, 2,095 albums, and 5,045 artists.
 | MFi 3.0 authentication | Verified | `mfi_local.py` loads a P-7B certificate and a PKCS#8 P-256 private key, signs the 32-byte challenge, and returns a 64-byte raw ECDSA signature. |
 | iAP2 link layer | Verified, experimental | `ref_iap2_link_layer.py` implements `FF 5A` framing, header and payload checksums, SYN/ACK negotiation, session multiplexing, and file-transfer session 12. |
 | Identification | Verified | `auth_test.py` declares the iAP2 HID component (`0x0012`) together with the required sent and received message lists. |
-| Now Playing | Verified | `0x5000` subscription and `0x5001` parsing in `web_app.py`; metadata, playback state, elapsed time, queue position, shuffle and repeat mode, application name, and artwork transfer ID. |
-| Media library mirror | Verified | `0x4C03` subscription and `0x4C04` updates, including reset, deletion, and revision handling; each device is persisted to `data/<library_id>/iap2.db`. |
+| Now Playing | Verified | `0x5000` subscription and `0x5001` parsing in `web_app.py`; metadata, playback state, elapsed time, queue position, shuffle and repeat mode, application name/bundle ID, playback speed, like/ban state, chapter count, and artwork transfer ID. |
+| Seek / queue jump | Verified | `0x5003` `SetNowPlayingInformation`; enabled only when `0x5001` advertises `SetElapsedTimeAvailable`; supports elapsed-time seek and device-queue index jumps. |
+| Device notifications | Verified | `0x4E09`–`0x4E0C`: device name, language, time/time-zone, and UUID. |
+| Power / battery | Rejected by test device | `0xAE00`/`0xAE01` are rejected during identification on the iPod touch (iOS 15.7.8); the UI reports power as unsupported. |
+| Media library mirror | Verified | `0x4C03` subscription and `0x4C04` updates, including reset, deletion, revision, update progress, resident-only state, and All Songs capability; each device is persisted to `data/<library_id>/iap2.db`. |
 | First-seen order | Implemented | Monotonic `first_seen_seq` batches in `iap2.db`, independent of RTC time; existing rows migrate as batch 1. |
 | HID media controls | Verified | Play, pause, next, previous, stop, shuffle, repeat, volume step, and mute through `0x6802`. |
 | Playback selection | Verified | `0x4C06` resumes the current selection; `0x4C07` plays an ordered item list; `0x4C08` plays an album, artist, or device playlist. |
@@ -138,6 +141,25 @@ The authentication exchange is:
 The signature is ECDSA over the 32-byte SHA-256 challenge with the P-256
 private key. The implementation converts the DER-encoded signature to the
 64-byte `r || s` form expected by the device.
+
+### Seek, queue jump, and device notifications
+
+`0x5001` reports `SetElapsedTimeAvailable` (playback attribute 13). When it is
+true, the accessory may send `0x5003 SetNowPlayingInformation` in response to a
+direct user action:
+
+```text
+param 0: ElapsedTime (uint32 ms)
+param 1: PlaybackQueueIndex (uint32)
+param 2: PlaybackQueueListContentTransferStartIndex (uint32)
+```
+
+The web UI uses param 0 for the seek slider and param 1 for device Up Next row
+clicks. `0x5002` is `StopNowPlayingUpdates`, not the setter.
+
+`0x4E09`–`0x4E0C` provide device information notifications: name, language,
+time/time-zone, and UUID. Power updates (`0xAE00`/`0xAE01`) are rejected by the
+test iPod touch during identification, so the UI has no battery value.
 
 ### Media library synchronization
 
@@ -335,9 +357,13 @@ service switches it to configuration 2 before opening the HID interface.
 The browser interface provides:
 
 - Now Playing metadata, playback state, elapsed time, queue position, shuffle
-  and repeat mode, application name, and artwork.
+  and repeat mode, application name/bundle ID, and artwork.
 - Play, pause, previous, next, stop, volume step, mute, shuffle, and repeat
   controls.
+- A seek slider driven by `0x5003` when the device advertises
+  `SetElapsedTimeAvailable`; clicking a device Up Next row jumps to that queue
+  index with `0x5003`.
+- Device name, language, time, and UUID notifications from `0x4E09`–`0x4E0C`.
 - Albums, artists, album artists, genres, songs, recently added tracks,
   `localPlaylist`, and device playlists.
 - Search, pagination, album sorting, album detail views, and playback of
@@ -415,6 +441,7 @@ endpoints are:
 | `POST` | `/api/queue/play` | Send the queued list to the device and start playback. |
 | `POST` | `/api/queue/clear` | Clear the editable Up Next queue. |
 | `POST` | `/api/command` | HID control command. |
+| `POST` | `/api/seek` | `{"elapsed_ms": n}` to seek, or `{"queue_index": n}` to jump within the device queue; uses `0x5003` when supported. |
 | `POST` | `/api/play` | Play an item, album, artist, genre, album artist, device playlist, or item list. |
 | `POST` | `/api/library/sync` | Clear the iAP2 revision and reconnect for a full synchronization. |
 | `POST` | `/api/library/sync-incremental` | Request an incremental `0x4C03` library update with the current revision. |
@@ -464,10 +491,15 @@ limit.
 
 - The link layer is experimental and does not provide a complete production
   retransmission and flow-control implementation.
-- iAP2 does not provide absolute volume control or a seek command. Volume is
-  controlled through HID increment and decrement usages. Fast-forward and
-  rewind usages are present in the HID descriptor, but a short press is
-  interpreted by the device as next or previous; seeking has not been verified.
+- iAP2 does not provide absolute volume control. Volume is controlled through
+  HID increment and decrement usages. Seek and device-queue jumps use `0x5003`
+  when the device advertises `SetElapsedTimeAvailable`; this is verified on the
+  iPod touch. HID fast-forward/rewind still behave as next/previous on a short
+  press.
+- The test iPod touch rejects `0xAE00`/`0xAE01` power-update messages during
+  identification, so battery level and charging state are not available over
+  iAP2 on this device. Use the libimobiledevice diagnostics path if battery
+  data is required.
 - Date Added is not part of the iAP2 media library. It is recovered from the
   device SQLite database over AFC. The value reflects the database content and
   may represent a bulk import or synchronization time.

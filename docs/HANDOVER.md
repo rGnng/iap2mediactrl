@@ -123,9 +123,11 @@ iOS device 的 USB descriptor 有 5 个 configuration：
 当前接受的消息列表：
 
 ```text
-sent:     AA01, AA03, 5000, 5002, 4C00, 4C02, 4C03, 4C05, 4C06, 4C07, 4C08, 4C09, 6800, 6802, 6803
-received: AA00, AA02, AA04, AA05, 5001, 4C01, 4C04, 6801, 6804
+sent:     AA01, AA03, 5000, 5002, 5003, 4C00, 4C02, 4C03, 4C05, 4C06, 4C07, 4C08, 4C09, 6800, 6802, 6803
+received: AA00, AA02, AA04, AA05, 5001, 4C01, 4C04, 6801, 6804, 4E09, 4E0A, 4E0B, 4E0C
 ```
+
+**Power 消息在这台 iPod touch 上不可用：** 把 `0xAE00/0xAE02/0xAE03` 加入 sent 或把 `0xAE01` 加入 received，设备都会以 param 6 拒绝 identification（实测 iOS 15.7.8）。因此电池/充电状态没有走 iAP2。
 
 **不要发送：**
 
@@ -151,10 +153,28 @@ RX CSM 0x5001
     app='Music'
 ```
 
-- media item 组内参数：1=title、4=duration_ms、6=album、12=artist、26=artwork transfer id
-- playback 组内参数：0=status、1=elapsed_ms、7=app
+- media item 组内参数：1=title、4=duration_ms、6=album、12=artist、26=artwork transfer id；
+  21–24=like/ban 支持与状态、27=chapter count
+- playback 组内参数：0=status、1=elapsed_ms、7=app、12=playback speed、13=SetElapsedTimeAvailable、
+  16=app bundle ID
 - 空媒体项时 title/album/artist 为空串、duration_ms=0、artwork_id 递增（已验证）
 - 设备会周期性重发 5001（artwork_id 变化时触发 FT artwork 提供，见 §3.7）
+
+#### 3.5.1 Seek / 队列跳转（0x5003）——已实测
+
+R29 §97.13.4 的 `0x5003 SetNowPlayingInformation` 可在用户直接操作时发送：
+
+| 参数 | 含义 |
+|---|---|
+| 0 | ElapsedTime（uint32 ms） |
+| 1 | PlaybackQueueIndex（uint32） |
+| 2 | PlaybackQueueListContentTransferStartIndex（uint32） |
+
+- 仅当 `0x5001` 的 playback param 13 `SetElapsedTimeAvailable=true` 时有效；真机实测为 true。
+- Web UI 的进度条发送 param 0；点击设备 Up Next 行发送 param 1。
+- **`0x5002` 是 StopNowPlayingUpdates，不是 SetNowPlayingInformation。**
+- 实测：从 200000 ms seek 后播放 3 秒再暂停，`elapsed_ms≈202265`；`queue_index=3` 后切到队列第 4 首。
+- 规范限制：只能由用户直接操作触发，不能与同一操作的 HID Play/Pause/Next/Previous 同时发送。
 
 ### 3.6 HID（播放/暂停/上一首/下一首）——已实测
 
@@ -237,13 +257,18 @@ Accessory → Device : Success [ft_id][0x05]（或 Failure 0x06）
 1: LastKnownMediaLibraryRevision       (utf8, 可选；不带=全量)
 2: MediaItemProperties                 (group of voids，属性 ID 见下)
 3: MediaPlaylistProperties             (group of voids)
+4: MediaLibraryUpdateProgress          (none; 请求进度)
+5: MediaLibraryIsHidingRemoteItems     (none)
+6: PlayAllSongsCapable                 (none)
 ```
 
 MediaItemProperties 子参数 ID（与 Now Playing 的 media item 属性一致）：
 0=PersistentID, 1=Title, 2=MediaType, 3=Rating, 4=DurationMs, 5=AlbumPID, 6=AlbumTitle,
 7=AlbumTrackNumber, 8=AlbumTrackCount, 9=DiscNumber, 10=DiscCount, 11=ArtistPID, 12=Artist,
-13=AlbumArtistPID, 14=AlbumArtist, 15=GenrePID, 16=Genre, 17=ComposerPID, 18=Composer, 19=Compilation…
-（MediaPlaylistProperties：0=PersistentID, 1=Name, 2=ParentPID, 3=IsGeniusMix, 4=IsFolder, 5=ContainedMediaItems）
+13=AlbumArtistPID, 14=AlbumArtist, 15=GenrePID, 16=Genre, 17=ComposerPID, 18=Composer, 19=Compilation,
+25=IsResidentOnDevice, 27=ChapterCount
+（MediaPlaylistProperties：0=PersistentID, 1=Name, 2=ParentPID, 3=IsGeniusMix, 4=IsFolder, 5=ContainedMediaItems；
+R29 另有 6=IsAppleMusicRadioStation、7=ContentTransfer，当前未请求）
 
 **0x4C04 MediaLibraryUpdate** 参数：
 
@@ -255,8 +280,15 @@ MediaItemProperties 子参数 ID（与 Now Playing 的 media item 属性一致�
 4: MediaItemDeletePersistentIdentifier   (u64, 0+)
 5: MediaPlaylistDeletePersistentIdentifier (u64, 0+)
 6: MediaLibraryReset                    (void; 收到后必须清空本地镜像并准备接收全量)
-7: 实测存在但规范 R2 未列出（1 字节标志；0x00=普通，0x5A=该批为"完整数据库"类消息）
+7: MediaLibraryUpdateProgress           (u8, 0–100)
+8: MediaLibraryIsHidingRemoteItems      (bool)
+9: PlayAllSongsCapable                  (bool)
 ```
+
+- 实测 `0x4C04 param7=0x5A`（90）出现在删除阶段末尾；现有实现仍把它当作
+  “删除阶段结束、重新订阅”的经验标志，同时把值显示为同步进度。
+- 真机实测：完整同步后 `library_progress=100`、`library_hiding_remote=False`、
+  `play_all_songs_capable=True`。
 
 **实测流程（iOS device：iPod touch / iPhone，iOS 15.7.8）：**
 
@@ -392,7 +424,7 @@ Web UI 的 Recently Added 现在优先使用真实 `date_added`，并在表格�
 | `csm.py` | 可用 | CSM 0x4040 编码/解析 |
 | `mfi_local.py` | 可用 | 本地 MFi provider |
 | `auth_test.py` | **可用（全部特性）** | 完整流程：link → auth → identification(含 HID) → 0x5000/0x4C00 → **HID play/pause/next/previous 实测** → **FT artwork 落盘** → 媒体库 0x4C03/0x4C04 实验（`LIB_EXPERIMENT=uuid` / `uuid+rev` / `full`）；`HID_COMMAND=play` / `pause` / `next` / ... 发送控制命令 |
-| `web_app.py` | **可用（常驻 Web UI）** | 后台线程维护 iAP2 会话（断线自动重连）+ HTTP API + 单页控制台；Now Playing/封面/专辑/艺术家/歌曲/localPlaylist/设备播放列表/音量/随机/循环/待播队列 |
+| `web_app.py` | **可用（常驻 Web UI）** | 后台线程维护 iAP2 会话（断线自动重连）+ HTTP API + 单页控制台；Now Playing/封面/专辑/艺术家/歌曲/localPlaylist/设备播放列表/音量/随机/循环/待播队列/**seek/队列跳转/设备通知** |
 | `run_web.sh` | 可用 | 启动 Web UI 的包装脚本（`PORT=8080 ./run_web.sh`） |
 | `docs/CACHE.md` | 文档 | 缓存/持久化机制、失效规则、嵌入式建议 |
 | `docs/reference/788716769-Accessory-Interface-Specification-R29.pdf` | 本地参考 | Apple R29 全文（1019 页）；0x4C09、队列 FT、MediaItem 属性表的权威依据；不纳入 Git |
@@ -466,8 +498,11 @@ cd /home/ops/iap2mediactrl
 
 浏览器打开 `http://<开发机IP>:8080/`（本机 `http://10.0.0.85:8080/`）。
 
-- 实时显示 Now Playing（标题/艺术家/专辑/进度/状态/队列/随机/循环/流派/音轨/App）与封面
+- 实时显示 Now Playing（标题/艺术家/专辑/进度/状态/队列/随机/循环/流派/音轨/App/App bundle ID）与封面
+- **进度条可拖动 seek**（`0x5003`，仅当设备 advertised `SetElapsedTimeAvailable`）；
+  点击设备 Up Next 行可跳到对应队列索引
 - 按钮：上一首 / 播放·暂停 / 下一首；**音量 −/+、静音、停止、随机、循环、继续当前队列**
+- Session 面板显示设备名称、语言、UUID；电源消息被设备拒绝，Battery 显示 `not supported`
 - **布局**：桌面两列（左：正在播放 / 队列 / Library 统计 / 会话；右：Browser 媒体库），页面顶部对齐；深色平面框线、直角、等宽字体、全英文界面。字号按 10/11/12/13/15/20px 分层，颜色按表面/文字四级 + 状态色统一。Library 统计含曲目/专辑/同步/rev/库列表，Resync 小按钮在左侧。
 - **MediaLibrary 面板**：AFC/iAP2 两列；所有操作按钮均为纯文字，无图标。
 - **媒体库面板**：曲目数/专辑数/同步状态/revision；列表统一为紧凑表格，八个标签页：
@@ -506,6 +541,7 @@ HTTP API：
 | GET | `/api/library/recent?q=&limit=&offset=` | 最近添加（优先 `date_added`，回退 `first_seen`；见 `note` 字段） |
 | GET | `/api/library/songs?q=&limit=&offset=&sort=` | 歌曲列表；sort=title/artist/album/duration/recent |
 | GET | `/api/queue` | Up Next 快照（设备队列或待播队列） |
+| POST | `/api/seek` | `{"elapsed_ms":n}` seek，或 `{"queue_index":n}` 跳设备队列；使用 `0x5003` |
 | POST | `/api/queue/add` | `{"item_ids":[...]}` 或 `{"album_pid":"..."}` 追加到待播队列 |
 | POST | `/api/queue/play` | `{"start_index":n}` 发送待播队列并播放 |
 | POST | `/api/queue/clear` | 清空待播队列 |
@@ -540,9 +576,12 @@ HTTP API：
 
 ### 6.2 Now Playing
 
-- 订阅 `0x5000`，请求 MediaItem 属性 1/4/6/12/26 与 PlaybackAttributes 0–7。
+- 订阅 `0x5000`，请求 MediaItem 属性 1–19、21–24、26、27 与 PlaybackAttributes 0–17。
 - `0x5001` 现在上报 status / elapsed / queue_index / queue_count / queue_chapter /
-  shuffle / repeat / app；Web UI 显示“队列 3/12、随机 歌曲、循环 全部”。
+  shuffle / repeat / app / playback speed / app bundle ID / seek availability /
+  like-ban state / chapter count；Web UI 显示“队列 3/12、随机 歌曲、循环 全部”。
+- `0x5003` 已实现：进度条 seek（ElapsedTime）和设备队列跳转（PlaybackQueueIndex）。
+  只在 `SetElapsedTimeAvailable=true` 且用户直接操作时发送；真机验证 seek 和队列跳转均有效。
 - status=2（暂停）时标题/专辑/艺术家仍上报；artwork_id 变化触发 FT Setup。
 
 ### 6.3 HID 控制
@@ -566,8 +605,8 @@ HID report descriptor 12 bit（`B0 B1 B5 B6 B9 BC E9 EA E2 B7 B3 B4`，2 字节 
 
 实测：扩展 descriptor 被设备接受；play/pause/next/previous、shuffle、repeat、stop、mute
 均能发送（stop 使 status→2，shuffle/repeat 有 0x5001 回传）。音量没有绝对值——iAP2
-规范没有音量消息，只能 HID 步进。FF/RW 短按实际表现为 next/previous，所以 UI 没有暴露为
-“seek”；绝对 seek 属于协议不支持。
+规范没有音量消息，只能 HID 步进。FF/RW 短按实际表现为 next/previous；绝对 seek 走
+`0x5003`（见 §3.5.1），不依赖 HID FF/RW。
 
 ### 6.4 Web UI / 播放列表
 
@@ -600,8 +639,10 @@ HID report descriptor 12 bit（`B0 B1 B5 B6 B9 BC E9 EA E2 B7 B3 B4`，2 字节 
 
 - **绝对音量**：iAP2 没有音量消息；HID 只有 Volume Increment/Decrement。静音已通过
   HID 0xE2 实现；绝对音量（0–100）未验证，设备可能只认步进。
-- **进度 seek/scrub**：Now Playing 只给 elapsed，没有 seek 命令；HID Fast Forward/Rewind
-  （0xB3/0xB4）已加入 descriptor，但短按被设备当作 next/previous，长按 seek 未验证。
+- **进度 seek/scrub**：已打通。`0x5003 SetNowPlayingInformation` 的 ElapsedTime 可 seek，
+  PlaybackQueueIndex 可跳队列；前提是 `0x5001` 的 SetElapsedTimeAvailable=true。真机实测
+  seek 后继续播放的 elapsed 正确，队列索引跳转也正确。HID FF/RW 仍只作辅助，短按会被设备
+  当作 next/previous。
 - **“添加日期”/Recently Added 原始字段**：iAP2 MediaItem property 0–20 没有日期；
   当前“最近添加”优先使用 AFC 导入的 `MediaLibrary.sqlitedb.item.date_added`，
   未导入时回退到 `first_seen`。未接入设备原生 Recently Added 特殊集合（见下）。
@@ -624,9 +665,12 @@ HID report descriptor 12 bit（`B0 B1 B5 B6 B9 BC E9 EA E2 B7 B3 B4`，2 字节 
   （实测只发 0–19 和 25），因此无法通过 iAP2 按条目请求封面；Now Playing 封面仍走 FT。
   媒体库专辑/曲目缩略图由独立 AFC 导入器 `media_db_artwork_import.py` 生成，
   存放在 `data/<library_id>/media-artwork/`，映射写入 `media-cache.db`。
-- **电池百分比**：`0xAE01 PowerUpdate` 只有 accessory power mode，没有设备电池电量。
-- **设备信息/时间/语言通知**：0x4E09–0x4E0C 存在，但当前未加入 identification 的
-  received 列表（避免识别风险）；价值低，未接入。
+- **电池百分比**：这台 iPod touch 在 identification 阶段直接拒绝 `0xAE00/0xAE02/0xAE03`
+  （sent）和 `0xAE01`（received），所以 iAP2 没有电池/充电状态。`web_app.py` 保留了
+  `0xAE01` 解析和 UI 占位，但不会声明这些消息；UI 显示 “not supported”。需要电池数据
+  时走 libimobiledevice 的 diagnostics 路径。
+- **设备信息/时间/语言通知**：已接入 `0x4E09`（名称）、`0x4E0A`（语言）、`0x4E0B`
+  （时间/时区）、`0x4E0C`（UUID）；真机均收到，显示在 Session 面板。
 - **歌词 / EQ / crossfade / 音效**：iAP2 媒体库/Now Playing 不提供。
 - **Web 鉴权 / 多设备**：当前无鉴权（仅 LAN）、单台 iOS device、单 iAP2 连接；生产需加 token/会话管理。
 

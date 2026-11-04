@@ -38,6 +38,7 @@ from auth_test import (
     send_csm,
     send_hid_command,
     send_hid_start,
+    send_now_playing_info,
     set_configuration,
 )
 from mfi_local import LocalMfiProvider
@@ -100,9 +101,38 @@ STATE = {
         "shuffle": None,
         "repeat": None,
         "app": "",
+        "app_bundle_id": "",
+        "playback_speed": None,
+        "seek_available": None,
+        "chapter_count": None,
+        "like_supported": None,
+        "ban_supported": None,
+        "liked": None,
+        "banned": None,
         "artwork_id": None,
         "updated_at": 0.0,
     },
+    "power": {
+        "max_current_ma": None,
+        "device_will_charge": None,
+        "accessory_power_mode": None,
+        "external_charger": None,
+        "charging_state": None,
+        "battery_level": None,
+        "updated_at": 0.0,
+    },
+    "device": {
+        "name": "",
+        "language": "",
+        "time_unix": None,
+        "timezone_offset_minutes": None,
+        "daylight_offset_minutes": None,
+        "uuid": "",
+        "updated_at": 0.0,
+    },
+    "library_progress": None,
+    "library_hiding_remote": None,
+    "play_all_songs_capable": None,
     "artwork_bytes": b"",
     "artwork_ready_id": None,
     "artwork_mime": "image/jpeg",
@@ -1862,6 +1892,11 @@ def snapshot():
             "connected": STATE["connected"],
             "link_state": STATE["link_state"],
             "now_playing": np,
+            "power": dict(STATE["power"]),
+            "device": dict(STATE["device"]),
+            "library_progress": STATE["library_progress"],
+            "library_hiding_remote": STATE["library_hiding_remote"],
+            "play_all_songs_capable": STATE["play_all_songs_capable"],
             "has_artwork": bool(STATE["artwork_bytes"]),
             "artwork_ready_id": STATE["artwork_ready_id"],
             "artwork_size": len(STATE["artwork_bytes"]),
@@ -2010,6 +2045,40 @@ class Session:
         if conn is None or conn.state != link_layer.STATE_NORMAL:
             raise RuntimeError("Link is not ready")
         await send_hid_command(conn, HID_BITS[command])
+
+    def seek(self, elapsed_ms=None, queue_index=None):
+        """0x5003 SetNowPlayingInformation: seek and/or jump in the queue."""
+        if elapsed_ms is None and queue_index is None:
+            raise ValueError("elapsed_ms or queue_index is required")
+        if not self.loop or not self.conn:
+            raise RuntimeError("iPod is not connected")
+        if elapsed_ms is not None:
+            with STATE_LOCK:
+                available = STATE["now_playing"].get("seek_available")
+            if available is not True:
+                raise RuntimeError(
+                    "Device has not advertised seek support "
+                    "(SetElapsedTimeAvailable is false)")
+        fut = asyncio.run_coroutine_threadsafe(
+            self._seek(elapsed_ms, queue_index), self.loop)
+        result = fut.result(timeout=5)
+        with STATE_LOCK:
+            if elapsed_ms is not None:
+                STATE["now_playing"]["elapsed_ms"] = int(elapsed_ms)
+                STATE["now_playing"]["updated_at"] = time.time() * 1000.0
+            if queue_index is not None:
+                STATE["now_playing"]["queue_index"] = int(queue_index)
+        return result
+
+    async def _seek(self, elapsed_ms, queue_index):
+        conn = self.conn
+        if conn is None or conn.state != link_layer.STATE_NORMAL:
+            raise RuntimeError("Link is not ready")
+        await send_now_playing_info(
+            conn, elapsed_ms=elapsed_ms, queue_index=queue_index)
+        self._event(
+            f"SetNowPlayingInformation elapsed={elapsed_ms} "
+            f"queue_index={queue_index}")
 
     def _library_uuid(self):
         with STATE_LOCK:
@@ -2361,8 +2430,14 @@ class Session:
                         np["composer"] = parse_string(child)
                     elif cid == 19:
                         np["compilation"] = child[0] if child else None
+                    elif cid in (21, 22, 23, 24) and child:
+                        key = {21: "like_supported", 22: "ban_supported",
+                               23: "liked", 24: "banned"}[cid]
+                        np[key] = bool(child[0])
                     elif cid == 26:
                         np["artwork_id"] = child[0] if child else None
+                    elif cid == 27:
+                        np["chapter_count"] = parse_u32(child)
             elif pid == 1:  # playback group
                 for cid, child in csm.parse_params(payload):
                     if cid == 0:
@@ -2381,10 +2456,16 @@ class Session:
                         np["repeat"] = child[0] if child else None
                     elif cid == 7:
                         np["app"] = parse_string(child)
+                    elif cid == 12:
+                        np["playback_speed"] = parse_u32(child)
+                    elif cid == 13 and child:
+                        np["seek_available"] = bool(child[0])
                     elif cid == 14 and child:
                         np["queue_available"] = bool(child[0])
                     elif cid == 15 and child:
                         np["queue_transfer_id"] = child[0]
+                    elif cid == 16:
+                        np["app_bundle_id"] = parse_string(child)
                     elif cid == 17:
                         np["queue_transfer"] = True
         np["updated_at"] = time.time() * 1000.0
@@ -2424,8 +2505,19 @@ class Session:
                 await send_hid_start(conn)
                 self._event("Connected")
             elif msg_id == 0x1D03:
+                rejected = []
+                for pid, payload in csm.parse_params(body):
+                    if pid in (6, 7) and payload:
+                        ids = [f"0x{int.from_bytes(payload[i:i + 2], 'big'):04x}"
+                               for i in range(0, len(payload) - 1, 2)]
+                        label = ("sent" if pid == 6 else "received")
+                        rejected.append(f"{label}: {', '.join(ids)}")
+                    else:
+                        rejected.append(f"param {pid}")
                 with STATE_LOCK:
-                    STATE["last_error"] = "identification rejected"
+                    STATE["last_error"] = (
+                        "identification rejected"
+                        + (": " + "; ".join(rejected) if rejected else ""))
             elif msg_id == 0x5001:
                 with STATE_LOCK:
                     self._handle_now_playing(body)
@@ -2437,6 +2529,44 @@ class Session:
                     set_queue([], "device")
                 if artwork_id is not None and artwork_id != ready_id:
                     load_cached_artwork(artwork_id)
+            elif msg_id == 0xAE01:
+                with STATE_LOCK:
+                    power = STATE["power"]
+                    for pid, payload in csm.parse_params(body):
+                        if pid == 0:
+                            power["max_current_ma"] = int.from_bytes(
+                                payload, "big")
+                        elif pid == 1 and payload:
+                            power["device_will_charge"] = bool(payload[0])
+                        elif pid == 2 and payload:
+                            power["accessory_power_mode"] = payload[0]
+                        elif pid == 4 and payload:
+                            power["external_charger"] = bool(payload[0])
+                        elif pid == 5 and payload:
+                            power["charging_state"] = payload[0]
+                        elif pid == 6 and payload:
+                            power["battery_level"] = payload[0]
+                    power["updated_at"] = time.time() * 1000.0
+            elif msg_id in (0x4E09, 0x4E0A, 0x4E0B, 0x4E0C):
+                with STATE_LOCK:
+                    device = STATE["device"]
+                    for pid, payload in csm.parse_params(body):
+                        if msg_id == 0x4E09 and pid == 0:
+                            device["name"] = parse_string(payload)
+                        elif msg_id == 0x4E0A and pid == 0:
+                            device["language"] = parse_string(payload)
+                        elif msg_id == 0x4E0B and pid == 0:
+                            device["time_unix"] = int.from_bytes(
+                                payload, "big")
+                        elif msg_id == 0x4E0B and pid == 1:
+                            device["timezone_offset_minutes"] = \
+                                int.from_bytes(payload, "big", signed=True)
+                        elif msg_id == 0x4E0B and pid == 2:
+                            device["daylight_offset_minutes"] = \
+                                int.from_bytes(payload, "big", signed=True)
+                        elif msg_id == 0x4E0C and pid == 0:
+                            device["uuid"] = parse_string(payload)
+                    device["updated_at"] = time.time() * 1000.0
             elif msg_id == 0x4C01:
                 libs = parse_library_info(body)
                 with STATE_LOCK:
@@ -2485,8 +2615,11 @@ class Session:
             # The device starts a full sync only when a revision is present;
             # "0" means "nothing known yet".
             csm.string(1, revision if revision else "0"),
-            csm.group(2, [csm.void(i) for i in range(0, 27)]),
+            csm.group(2, [csm.void(i) for i in range(0, 28)]),
             csm.group(3, [csm.void(i) for i in range(0, 6)]),
+            # Request update progress, resident-only state, and All Songs
+            # capability in addition to the items/playlists above.
+            csm.void(4), csm.void(5), csm.void(6),
         ]
         self._event(f"Media library subscription revision={revision or '0'}")
         await send_csm(conn, 0x4C03, params)
@@ -2499,6 +2632,8 @@ class Session:
         playlists = []
         deleted_items = []
         deleted_playlists = []
+        hiding_remote = None
+        play_all_songs = None
         for pid, payload in csm.parse_params(body):
             if pid == 1:
                 rev = parse_string(payload)
@@ -2514,6 +2649,10 @@ class Session:
                 deleted_playlists.append(f"{int.from_bytes(payload, 'big'):016x}")
             elif pid == 7 and payload:
                 last7 = payload[0]
+            elif pid == 8 and payload:
+                hiding_remote = bool(payload[0])
+            elif pid == 9 and payload:
+                play_all_songs = bool(payload[0])
         with LIBRARY_LOCK:
             changed = False
             now = time.time()
@@ -2582,6 +2721,14 @@ class Session:
             ftid = pl.get("contained_ft_id")
             if ftid is not None and ftid in FT_PLAYLIST_FILES:
                 apply_playlist_ft(ftid, FT_PLAYLIST_FILES[ftid])
+        if last7 is not None or hiding_remote is not None or play_all_songs is not None:
+            with STATE_LOCK:
+                if last7 is not None:
+                    STATE["library_progress"] = last7
+                if hiding_remote is not None:
+                    STATE["library_hiding_remote"] = hiding_remote
+                if play_all_songs is not None:
+                    STATE["play_all_songs_capable"] = play_all_songs
         return rev, last7, items, playlists
 
 
@@ -2868,15 +3015,17 @@ input::placeholder { color: var(--text-4); }
 .now-card .queue,
 .now-card .np-details { margin-top: 3px; font-size: var(--fs-micro); color: var(--text-4); }
 
-.progress { margin-top: 4px; padding-top: 8px; }
-.bar { height: 4px; background: var(--surface-3); overflow: hidden; }
-.bar span {
-  display: block;
-  height: 100%;
-  width: 0%;
-  background: var(--accent);
-  transition: width .25s linear;
+.progress { margin-top: 4px; padding-top: 4px; }
+.progress input[type="range"] {
+  width: 100%;
+  height: 18px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent);
+  background: transparent;
+  cursor: pointer;
 }
+.progress input[type="range"]:disabled { opacity: .35; cursor: default; }
 .times {
   display: flex;
   justify-content: space-between;
@@ -3488,7 +3637,8 @@ button .bi { font-size: 1.15em; }
       <div class="np-details" id="np-details"></div>
 
       <div class="progress">
-        <div class="bar"><span id="bar"></span></div>
+        <input id="seek" type="range" min="0" max="1" value="0" step="1000"
+               disabled title="Seek" aria-label="Seek">
         <div class="times"><span id="elapsed">0:00</span><span id="duration">0:00</span></div>
       </div>
 
@@ -3538,6 +3688,8 @@ button .bi { font-size: 1.15em; }
       <div class="kv"><span>Connection</span><span id="kv-conn">—</span></div>
       <div class="kv"><span>Link state</span><span id="kv-link">—</span></div>
       <div class="kv"><span>App</span><span id="kv-app">—</span></div>
+      <div class="kv"><span>Device</span><span id="kv-device">—</span></div>
+      <div class="kv"><span>Battery</span><span id="kv-battery">—</span></div>
       <div class="kv"><span>Artwork ID / Size</span><span id="kv-art">—</span></div>
       <div class="kv"><span>Last event</span><span id="kv-event">—</span></div>
       <div class="kv"><span>Error</span><span id="kv-err" class="err">—</span></div>
@@ -3738,6 +3890,7 @@ let state = null;
 let shownArt = null;
 let lastLibraryId = null;
 let lastMediaJobState = null;
+let seekDragging = false;
 
 function fmt(ms) {
   ms = Math.max(0, ms || 0);
@@ -3914,6 +4067,16 @@ function render(s) {
   $("#kv-conn").textContent = connected ? "Authenticated" : "Disconnected";
   $("#kv-link").textContent = LINK[s.link_state] ?? "—";
   $("#kv-app").textContent = np.app || "—";
+  const dev = s.device || {};
+  const power = s.power || {};
+  $("#kv-device").textContent = dev.name || "—";
+  const chargeState = ({0: "charging off", 1: "charging",
+                        2: "charged"})[power.charging_state];
+  $("#kv-battery").textContent = power.battery_level == null
+      ? (connected ? "not supported" : "—")
+      : power.battery_level + "%" +
+        (chargeState ? " · " + chargeState : "") +
+        (power.external_charger ? " · external power" : "");
   $("#kv-art").textContent = (np.artwork_id ?? "—") + " / " +
       (s.artwork_size ? Math.round(s.artwork_size / 1024) + " KB" : "—");
   $("#kv-event").textContent = s.last_event || "—";
@@ -4092,10 +4255,37 @@ function tick() {
   if (np.status === 1 && np.updated_at) elapsed += Date.now() - np.updated_at;
   const dur = np.duration_ms || 0;
   if (dur > 0) elapsed = Math.min(elapsed, dur);
-  $("#elapsed").textContent = fmt(elapsed);
+  const seek = $("#seek");
+  const canSeek = !!(state.connected && state.link_state === 2 &&
+                     np.seek_available === true && dur > 0);
+  seek.disabled = !canSeek;
+  seek.max = String(Math.max(1, dur));
+  seek.title = canSeek ? "Seek" :
+      "Device has not advertised seek support (SetElapsedTimeAvailable)";
+  if (!seekDragging) {
+    seek.value = String(Math.min(elapsed, Math.max(1, dur)));
+    $("#elapsed").textContent = fmt(elapsed);
+  }
   $("#duration").textContent = fmt(dur);
-  $("#bar").style.width = dur > 0 ? (100 * elapsed / dur).toFixed(1) + "%" : "0%";
 }
+
+const seekEl = $("#seek");
+seekEl.addEventListener("input", () => {
+  seekDragging = true;
+  $("#elapsed").textContent = fmt(Number(seekEl.value));
+});
+seekEl.addEventListener("change", async () => {
+  const ms = Number(seekEl.value);
+  seekDragging = false;
+  try {
+    const j = await postJson("/api/seek", {elapsed_ms: ms});
+    if (!j.ok) toast(j.error || "Seek failed");
+    setTimeout(poll, 200);
+  } catch (e) {
+    toast("Seek failed");
+  }
+});
+seekEl.addEventListener("pointercancel", () => { seekDragging = false; });
 
 async function command(cmd) {
   try {
@@ -4934,12 +5124,27 @@ $("#lib-genres").onclick = (ev) => {
   if (el) showGenre(el.dataset.genreName || "");
 };
 
+async function jumpQueue(index) {
+  try {
+    const j = await postJson("/api/seek", {queue_index: index});
+    if (!j.ok) toast(j.error || "Queue jump failed");
+    setTimeout(poll, 250);
+  } catch (e) {
+    toast("Queue jump failed");
+  }
+}
+
 $("#upnext").onclick = (ev) => {
   const el = ev.target.closest(".upnext-row[data-id]");
   if (!el) return;
   const q = state && state.queue;
   if (q && q.source === "queued") {
     playQueue(Number(el.dataset.index) || 0);
+  } else if (q && q.source === "device" &&
+             state.now_playing && state.now_playing.seek_available === true) {
+    const target = (q.base_index || 0) + (q.index || 0) +
+        (Number(el.dataset.index) || 0);
+    jumpQueue(target);
   } else {
     playItem(el.dataset.id);
   }
@@ -5546,6 +5751,24 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 SESSION.send_command(command)
                 self._json({"ok": True, "command": command})
+            elif path == "/api/seek":
+                elapsed = payload.get("elapsed_ms")
+                queue_index = payload.get("queue_index")
+                if elapsed is None and queue_index is None:
+                    self._json({"ok": False,
+                                "error": "elapsed_ms or queue_index required"},
+                               400)
+                    return
+                try:
+                    elapsed = int(elapsed) if elapsed is not None else None
+                    queue_index = (int(queue_index)
+                                   if queue_index is not None else None)
+                except (TypeError, ValueError):
+                    self._json({"ok": False, "error": "invalid position"}, 400)
+                    return
+                SESSION.seek(elapsed_ms=elapsed, queue_index=queue_index)
+                self._json({"ok": True, "elapsed_ms": elapsed,
+                            "queue_index": queue_index})
             elif path == "/api/library/sync":
                 SESSION.resync_library()
                 self._json({"ok": True, "message": "resync requested"})
@@ -5747,6 +5970,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": str(exc)}, 404)
         except ValueError as exc:
             self._json({"ok": False, "error": str(exc)}, 400)
+        except RuntimeError as exc:
+            self._json({"ok": False, "error": str(exc)}, 409)
         except Exception as exc:  # noqa: BLE001
             self._json({"ok": False, "error": str(exc)}, 500)
 
@@ -5764,6 +5989,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": False, "error": str(exc)}, 404)
         except ValueError as exc:
             self._json({"ok": False, "error": str(exc)}, 400)
+        except RuntimeError as exc:
+            self._json({"ok": False, "error": str(exc)}, 409)
         except Exception as exc:  # noqa: BLE001
             self._json({"ok": False, "error": str(exc)}, 500)
 
